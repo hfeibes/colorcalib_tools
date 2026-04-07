@@ -48,15 +48,20 @@ for rep in measurements:
     rep_data = photodata[photodata['rep']==rep]
     for color_id in colors:
         color_data = rep_data[rep_data['id']==color_id]
-        wavelength_spectra = color_data['nm'].to_numpy()
-        spectra_measured = color_data['power'].to_numpy()
-        wavelength_common, xyz_common, spectra_measured_common = commondomain(x1,y1,
-                                                                              wavelength_spectra,
-                                                                              spectra_measured)
-        
-        XYZ = spectra_measured_common @ xyz_common # units = radiance
-        all_xyz.append([rep, color_id, color_data['r'].iloc[0],
+        if color_data['r'].iloc[0]<0. or color_data['g'].iloc[0]<0. or color_data['b'].iloc[0]<0.:
+            all_xyz.append([rep, color_id, color_data['r'].iloc[0],
                         color_data['g'].iloc[0],color_data['b'].iloc[0],
-                        XYZ[0], XYZ[1], XYZ[2]])
+                        -1.,-1.,-1.])
+        else:
+            wavelength_spectra = color_data['nm'].to_numpy()
+            spectra_measured = color_data['power'].to_numpy()
+            wavelength_common, xyz_common, spectra_measured_common = commondomain(x1,y1,
+                                                                                  wavelength_spectra,
+                                                                                  spectra_measured)
+            
+            XYZ = spectra_measured_common @ xyz_common # units = radiance
+            all_xyz.append([rep, color_id, color_data['r'].iloc[0],
+                            color_data['g'].iloc[0],color_data['b'].iloc[0],
+                            XYZ[0], XYZ[1], XYZ[2]])
 measured_xyz = pd.DataFrame(all_xyz, columns = ['rep', 'id', 'r', 'g', 'b', 'X', 'Y', 'Z'])
 measured_xyz.to_csv(os.path.join(outdir, outname + '_measured_XYZ.csv'), index=False)
