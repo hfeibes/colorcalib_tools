@@ -6,7 +6,7 @@ import argparse
 import pandas as pd
 import csv
 import sys
-from psychopy import core, visual, hardware
+from psychopy import core, visual, hardware, event
 from psychopy_photoresearch.pr import PR655
 
 event.globalKeys.add(key='q', func=core.quit) # to quit at any time point
