@@ -22,7 +22,7 @@ centercross = visual.ShapeStim(
     size=(win.size[1]/30, win.size[1]/30), pos=(0, 0),
     lineColor='white', fillColor='white')
 # Present
-fixation.draw()
+centercross.draw()
 win.flip()
 # Wait up to 30 seconds before ending script if no key input
 keys = event.waitKeys(maxWait=30.0, keyList=['escape', 'space'])

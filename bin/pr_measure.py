@@ -9,6 +9,8 @@ import sys
 from psychopy import core, visual, hardware
 from psychopy_photoresearch.pr import PR655
 
+event.globalKeys.add(key='q', func=core.quit) # to quit at any time point
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--in_rgb', required=True, help='txt with rgb rows')
 parser.add_argument('--out_csv', required=True, help='output csv')
@@ -49,36 +51,41 @@ with open(args.out_csv, 'w', newline='') as f:
         # Go through all colors
         for i in range(len(rgb_defs)):
             color_rgb = rgb_defs.iloc[i]
-            colorstim.fillColor = [color_rgb['R'],color_rgb['G'],color_rgb['B']]
-            colorstim.draw()
-            win.flip()
-            core.wait(args.waittime) # Wait _ seconds after presentation before measurement
-            
-            phot.measure(timeOut=15.0) # If measurement takes longer than 15 seconds, something is probably wrong
-            spec = phot.getLastSpectrum(parse=True)
-            wavelengths, powers = spec # separate the arrays in spec
-            
-            # Plot cartoon of spectrum (visual feedback so you know it looks reasonable)
-            # Normalize x and then scale and flip so Long->Short left to right
-            x = (wavelengths - wavelengths.min()) / (wavelengths.max() - wavelengths.min())
-            x = (x - 0.5) * (win.size[0] * -0.3) 
-            y = (powers - powers.min()) / (powers.max() - powers.min())
-            y = (y - 0.5) * (win.size[0] * 0.1) 
+            # To handle colors that are out of gamut
+            if color_rgb['R']<0. or color_rgb['G']<0. or color_rgb['B']<0.:
+                w.writerow([rep, color_rgb['ID'],color_rgb['R'],color_rgb['G'],color_rgb['B'], -1., -1.])
+            # If color def is valid
+            else:
+                colorstim.fillColor = [color_rgb['R'],color_rgb['G'],color_rgb['B']]
+                colorstim.draw()
+                win.flip()
+                core.wait(args.waittime) # Wait _ seconds after presentation before measurement
+                
+                phot.measure(timeOut=15.0) # If measurement takes longer than 15 seconds, something is probably wrong
+                spec = phot.getLastSpectrum(parse=True)
+                wavelengths, powers = spec # separate the arrays in spec
+                
+                # Plot cartoon of spectrum (visual feedback so you know it looks reasonable)
+                # Normalize x and then scale and flip so Long->Short left to right
+                x = (wavelengths - wavelengths.min()) / (wavelengths.max() - wavelengths.min())
+                x = (x - 0.5) * (win.size[0] * -0.3) 
+                y = (powers - powers.min()) / (powers.max() - powers.min())
+                y = (y - 0.5) * (win.size[0] * 0.1) 
 
-            plot = visual.ShapeStim(
-                win,
-                vertices=list(zip(x, y)),
-                lineColor="white",
-                lineWidth=2,
-                closeShape=False)
+                plot = visual.ShapeStim(
+                    win,
+                    vertices=list(zip(x, y)),
+                    lineColor="white",
+                    lineWidth=2,
+                    closeShape=False)
 
-            win.flip()
-            plot.draw()
-            win.flip()
-            core.wait(1.0) # Plot spectrum cartoon for 1 s
-            
-            # Write all info to row in output csv
-            for nm, power in zip(wavelengths, powers):
-                w.writerow([rep, color_rgb['ID'],color_rgb['R'],color_rgb['G'],color_rgb['B'], float(nm), float(power)])
+                win.flip()
+                plot.draw()
+                win.flip()
+                core.wait(1.0) # Plot spectrum cartoon for 1 s
+                
+                # Write all info to row in output csv
+                for nm, power in zip(wavelengths, powers):
+                    w.writerow([rep, color_rgb['ID'],color_rgb['R'],color_rgb['G'],color_rgb['B'], float(nm), float(power)])
 win.close()
 core.quit()
