@@ -16,10 +16,12 @@ parser.add_argument('--in_rgb', required=True, help='txt with rgb rows')
 parser.add_argument('--out_csv', required=True, help='output csv')
 parser.add_argument('--photometer', required=True, help='PR655 or PR670')
 parser.add_argument('--port', default='/dev/cu.usbmodem1101', type=str, help='serial port PR is plugged into') #'/dev/cu.usbmodem1101'
-parser.add_argument('--waittime', type=float, default=1.0, help='time between color pres and measurement started')
-parser.add_argument('--reps', type=int, default=3, help='how many measures to take per color')
+parser.add_argument('--waittime', type=float, default=3.0, help='time between color pres and measurement started')
+parser.add_argument('--reps', type=int, default=1, help='how many measures to take per color')
 parser.add_argument('--screenpixw', default=2560, type=int)
 parser.add_argument('--screenpixh', default=1600, type=int)
+parser.add_argument('--on_timer', default=False, type=bool)
+parser.add-argument('--time_between' default = 20., type=float)
 args = parser.parse_args()
 
 if args.photometer == 'PR655':
@@ -42,6 +44,8 @@ colorstim = visual.Rect(win, width=win.size[0], height= win.size[1],
 # Start PR remote mode
 phot.startRemoteMode()
 
+# Start clock; used if measurements are being taken strictly on timer
+cycle = core.Clock()
 # Run measurements
 with open(args.out_csv, 'w', newline='') as f:
     w = csv.writer(f)
@@ -53,15 +57,29 @@ with open(args.out_csv, 'w', newline='') as f:
             color_rgb = rgb_defs.iloc[i]
             # To handle colors that are out of gamut
             if color_rgb['R']<0. or color_rgb['G']<0. or color_rgb['B']<0.:
+                colorstim.fillColor = [0.,0.,0.]
+                colorstim.draw()
+                win.flip()
+                cycle.reset()
                 w.writerow([rep, color_rgb['ID'],color_rgb['R'],color_rgb['G'],color_rgb['B'], -1., -1.])
+                # Pad to overall total time if working on timer rather than direct measurements
+                remaining = args.time_between - cycle.getTime()
+                if args.on_timer == True:
+                    if remaining > 0:
+                    core.wait(remaining)
+                    else:
+                        print('ERROR: color measurements became out of sync during presentation of color ', str(color_rgb['ID']), ' please increase argument time_between')
+                        win.close()
+                        core.quit()
             # If color def is valid
             else:
                 colorstim.fillColor = [color_rgb['R'],color_rgb['G'],color_rgb['B']]
                 colorstim.draw()
                 win.flip()
+                cycle.reset()
                 core.wait(args.waittime) # Wait _ seconds after presentation before measurement
                 
-                phot.measure(timeOut=15.0) # If measurement takes longer than 15 seconds, something is probably wrong
+                phot.measure(timeOut=8.0) # If measurement takes longer than 8 seconds, something is probably wrong
                 spec = phot.getLastSpectrum(parse=True)
                 wavelengths, powers = spec # separate the arrays in spec
                 
@@ -87,5 +105,15 @@ with open(args.out_csv, 'w', newline='') as f:
                 # Write all info to row in output csv
                 for nm, power in zip(wavelengths, powers):
                     w.writerow([rep, color_rgb['ID'],color_rgb['R'],color_rgb['G'],color_rgb['B'], float(nm), float(power)])
+                    
+                # Pad to overall total time if working on timer rather than direct measurements
+                remaining = args.time_between - cycle.getTime()
+                if args.on_timer == True:
+                    if remaining > 0:
+                    core.wait(remaining)
+                    else:
+                        print('ERROR: color measurements became out of sync during presentation of color ', str(color_rgb['ID']), ' please increase argument time_between')
+                        win.close()
+                        core.quit()
 win.close()
 core.quit()
