@@ -21,7 +21,7 @@ parser.add_argument('--reps', type=int, default=1, help='how many measures to ta
 parser.add_argument('--screenpixw', default=2560, type=int)
 parser.add_argument('--screenpixh', default=1600, type=int)
 parser.add_argument('--on_timer', default=False, type=bool)
-parser.add-argument('--time_between' default = 20., type=float)
+parser.add_argument('--time_between', default=20., type=float)
 args = parser.parse_args()
 
 if args.photometer == 'PR655':
@@ -66,7 +66,7 @@ with open(args.out_csv, 'w', newline='') as f:
                 remaining = args.time_between - cycle.getTime()
                 if args.on_timer == True:
                     if remaining > 0:
-                    core.wait(remaining)
+                        core.wait(remaining)
                     else:
                         print('ERROR: color measurements became out of sync during presentation of color ', str(color_rgb['ID']), ' please increase argument time_between')
                         win.close()
@@ -110,7 +110,7 @@ with open(args.out_csv, 'w', newline='') as f:
                 remaining = args.time_between - cycle.getTime()
                 if args.on_timer == True:
                     if remaining > 0:
-                    core.wait(remaining)
+                        core.wait(remaining)
                     else:
                         print('ERROR: color measurements became out of sync during presentation of color ', str(color_rgb['ID']), ' please increase argument time_between')
                         win.close()
