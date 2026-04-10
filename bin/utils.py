@@ -210,17 +210,15 @@ class XYZRGBScreenModel:
     """
     Screen model with per-channel nonlinearity and linear RGB<->XYZ transform.
 
-    Default (legacy) mode:
-      rgb_lin = (rgb_code / 255) ** gamma_rgb
-      xyz_corr = rgb_lin @ M_rgb2xyz
-      xyz = xyz_corr + black_xyz
+    Base model:
+      rgb_lin = trc(rgb_code / 255)           # or gamma fallback
+      xyz_base = rgb_lin @ M_rgb2xyz + black
 
-    Robust mode (preferred when calibration ramps are available):
-      rgb_lin[c] = trc_c(rgb_code[c] / 255)
-      xyz_corr = rgb_lin @ M_rgb2xyz
-      xyz = xyz_corr + black_xyz
+    Optional grey-ramp correction (enabled by default after fit):
+      xyz = xyz_base + w_neutral(rgb_lin) * delta_gray(mean(rgb_lin))
 
-    where each trc_c is a monotonic piecewise curve fit from single-channel ramps.
+    This captures neutral-axis color/luminance drift (common on real panels)
+    while preserving colored-point behavior.
     """
 
     def __init__(
@@ -233,6 +231,10 @@ class XYZRGBScreenModel:
         trc_code=None,
         trc_linear=None,
         model_variant="gamma_matrix",
+        gray_lin=None,
+        gray_delta_xyz=None,
+        neutral_power=2.0,
+        gray_correction_enabled=False,
     ):
         self.black_xyz = np.asarray(black_xyz, dtype=float).reshape(3)
         self.white_xyz = np.asarray(white_xyz, dtype=float).reshape(3)
@@ -256,6 +258,17 @@ class XYZRGBScreenModel:
         self.model_variant = str(model_variant)
         if self.trc_code is not None:
             self.model_variant = "trc_matrix"
+
+        self.gray_lin = None
+        self.gray_delta_xyz = None
+        self.neutral_power = float(neutral_power)
+        self.gray_correction_enabled = bool(gray_correction_enabled)
+        self._set_gray_correction(
+            gray_lin=gray_lin,
+            gray_delta_xyz=gray_delta_xyz,
+            neutral_power=neutral_power,
+            enabled=gray_correction_enabled,
+        )
 
     @staticmethod
     def _normalize_trc_list(values, name):
@@ -320,6 +333,45 @@ class XYZRGBScreenModel:
         if self.trc_code is not None:
             self.model_variant = "trc_matrix"
 
+    def _set_gray_correction(self, gray_lin=None, gray_delta_xyz=None, neutral_power=2.0, enabled=False):
+        self.neutral_power = float(neutral_power)
+        self.gray_correction_enabled = bool(enabled)
+
+        if gray_lin is None or gray_delta_xyz is None:
+            self.gray_lin = None
+            self.gray_delta_xyz = None
+            self.gray_correction_enabled = False
+            return
+
+        lin = np.asarray(gray_lin, dtype=float).ravel()
+        delta = np.asarray(gray_delta_xyz, dtype=float)
+        if delta.ndim != 2 or delta.shape[1] != 3:
+            raise ValueError("gray_delta_xyz must have shape Nx3.")
+        if lin.size != delta.shape[0] or lin.size < 2:
+            raise ValueError("gray_lin and gray_delta_xyz must have matching length >= 2.")
+
+        order = np.argsort(lin)
+        lin = lin[order]
+        delta = delta[order]
+
+        tmp = pd.DataFrame({"lin": lin, "dx": delta[:, 0], "dy": delta[:, 1], "dz": delta[:, 2]})
+        tmp = tmp.groupby("lin", as_index=False)[["dx", "dy", "dz"]].mean().sort_values("lin")
+
+        lin = tmp["lin"].to_numpy(dtype=float)
+        delta = tmp[["dx", "dy", "dz"]].to_numpy(dtype=float)
+
+        # Anchor black correction to zero.
+        if lin[0] > 0.0:
+            lin = np.r_[0.0, lin]
+            delta = np.vstack([np.zeros((1, 3), dtype=float), delta])
+        else:
+            lin[0] = 0.0
+            delta[0] = 0.0
+
+        self.gray_lin = lin
+        self.gray_delta_xyz = delta
+        self.gray_correction_enabled = bool(enabled)
+
     def _eval_trc_forward(self, rgb_norm, clip=True):
         out = np.zeros_like(rgb_norm, dtype=float)
         for c in range(3):
@@ -339,7 +391,6 @@ class XYZRGBScreenModel:
             xp = self.trc_linear[c]
             fp = self.trc_code[c]
 
-            # enforce strictly increasing xp for inversion
             xp_u, idx = np.unique(xp, return_index=True)
             fp_u = fp[idx]
             if xp_u.size < 2:
@@ -352,6 +403,50 @@ class XYZRGBScreenModel:
             else:
                 out[:, c] = self._interp_with_extrap(x, xp_u, fp_u)
         return out
+
+    def _rgb_norm_to_lin(self, rgb_norm, clip=True):
+        if self.trc_code is not None:
+            return self._eval_trc_forward(rgb_norm, clip=clip)
+        if clip:
+            rgb_norm = np.clip(rgb_norm, 0.0, 1.0)
+        return np.power(np.clip(rgb_norm, 0.0, None), self.gamma_rgb[None, :])
+
+    def _lin_to_rgb_norm(self, rgb_lin, clip=True):
+        if self.trc_code is not None:
+            return self._eval_trc_inverse(rgb_lin, clip=clip)
+        if clip:
+            rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
+        return np.power(np.clip(rgb_lin, 0.0, None), 1.0 / self.gamma_rgb[None, :])
+
+    def _base_xyz_from_rgb_lin(self, rgb_lin):
+        return rgb_lin @ self.M_rgb2xyz + self.black_xyz[None, :]
+
+    def _base_rgb_lin_from_xyz(self, xyz):
+        return (xyz - self.black_xyz[None, :]) @ self.M_xyz2rgb_lin
+
+    def _neutrality_weight(self, rgb_lin):
+        rgb_lin = np.asarray(rgb_lin, dtype=float)
+        spread = rgb_lin.max(axis=1) - rgb_lin.min(axis=1)
+        amp = np.maximum(rgb_lin.max(axis=1), 1e-8)
+        neutrality = np.clip(1.0 - spread / amp, 0.0, 1.0)
+        return np.power(neutrality, self.neutral_power)
+
+    def _gray_delta_from_lin(self, s_lin):
+        if self.gray_lin is None or self.gray_delta_xyz is None:
+            return np.zeros((len(np.asarray(s_lin).ravel()), 3), dtype=float)
+        s = np.asarray(s_lin, dtype=float).ravel()
+        out = np.zeros((s.size, 3), dtype=float)
+        for j in range(3):
+            out[:, j] = np.interp(s, self.gray_lin, self.gray_delta_xyz[:, j])
+        return out
+
+    def _apply_gray_correction_forward(self, rgb_lin, xyz_base):
+        if not self.gray_correction_enabled or self.gray_lin is None:
+            return xyz_base
+        s = rgb_lin.mean(axis=1)
+        w = self._neutrality_weight(rgb_lin)
+        d = self._gray_delta_from_lin(s)
+        return xyz_base + w[:, None] * d
 
     def _estimate_effective_gamma(self, trc_code, trc_linear):
         gammas = []
@@ -386,7 +481,6 @@ class XYZRGBScreenModel:
         if df.empty:
             raise ValueError("No valid calibration rows after numeric coercion and NaN removal.")
 
-        # Average repeated measurements for each RGB code triplet.
         df_agg = (
             df.groupby(["r", "g", "b"], as_index=False)[["X", "Y", "Z"]]
             .mean()
@@ -489,7 +583,12 @@ class XYZRGBScreenModel:
                 code[-1] = 1.0
                 scalar[-1] = 1.0
 
-            tmp = pd.DataFrame({"code": code, "lin": scalar}).groupby("code", as_index=False)["lin"].max().sort_values("code")
+            tmp = (
+                pd.DataFrame({"code": code, "lin": scalar})
+                .groupby("code", as_index=False)["lin"]
+                .max()
+                .sort_values("code")
+            )
             code = tmp["code"].to_numpy(dtype=float)
             scalar = np.maximum.accumulate(tmp["lin"].to_numpy(dtype=float))
             scalar = np.clip(scalar, 0.0, 1.0)
@@ -519,6 +618,42 @@ class XYZRGBScreenModel:
             "trc_linear": trc_linear,
         }
 
+    def _fit_gray_correction(self, df_agg):
+        grey = df_agg.loc[(df_agg["r"] == df_agg["g"]) & (df_agg["g"] == df_agg["b"]), ["r", "g", "b", "X", "Y", "Z"]].copy()
+        if len(grey) < 4:
+            self._set_gray_correction(None, None, neutral_power=self.neutral_power, enabled=False)
+            return
+
+        grey = grey.sort_values("r").reset_index(drop=True)
+        rgb = grey[["r", "g", "b"]].to_numpy(dtype=float)
+        rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0)
+        rgb_lin = self._rgb_norm_to_lin(rgb_norm, clip=True)
+
+        xyz_meas = grey[["X", "Y", "Z"]].to_numpy(dtype=float)
+        xyz_base = self._base_xyz_from_rgb_lin(rgb_lin)
+        delta = xyz_meas - xyz_base
+
+        s = rgb_lin.mean(axis=1)
+        tmp = (
+            pd.DataFrame({"lin": s, "dx": delta[:, 0], "dy": delta[:, 1], "dz": delta[:, 2]})
+            .groupby("lin", as_index=False)[["dx", "dy", "dz"]]
+            .mean()
+            .sort_values("lin")
+        )
+
+        lin = tmp["lin"].to_numpy(dtype=float)
+        d = tmp[["dx", "dy", "dz"]].to_numpy(dtype=float)
+
+        # Force black endpoint correction to zero.
+        if lin[0] > 0.0:
+            lin = np.r_[0.0, lin]
+            d = np.vstack([np.zeros((1, 3), dtype=float), d])
+        else:
+            lin[0] = 0.0
+            d[0] = 0.0
+
+        self._set_gray_correction(lin, d, neutral_power=self.neutral_power, enabled=True)
+
     def fit(
         self,
         calibration_data,
@@ -526,6 +661,8 @@ class XYZRGBScreenModel:
         gamma_bounds=(0.8, 4.0),
         max_iter=2000,
         mode="auto",
+        include_gray_ramp_correction=True,
+        neutral_power=2.0,
     ):
         """
         Fit model from calibration measurements with columns: r, g, b, X, Y, Z.
@@ -542,13 +679,16 @@ class XYZRGBScreenModel:
             Maximum optimizer iterations for gamma fallback.
         mode : str
             One of: "auto", "trc_matrix", "gamma_matrix".
-            - auto: try robust trc_matrix first, fallback to gamma_matrix.
-            - trc_matrix: require robust fit.
-            - gamma_matrix: force legacy gamma fit.
+        include_gray_ramp_correction : bool
+            If True, fit neutral-axis correction from the measured grey ramp.
+        neutral_power : float
+            Exponent controlling how strongly correction is restricted to neutral colors.
         """
         mode = str(mode).lower()
         if mode not in {"auto", "trc_matrix", "gamma_matrix"}:
             raise ValueError("mode must be one of: 'auto', 'trc_matrix', 'gamma_matrix'.")
+
+        self.neutral_power = float(neutral_power)
 
         df_agg = self._prepare_calibration_df(calibration_data)
 
@@ -571,6 +711,11 @@ class XYZRGBScreenModel:
         if self.trc_code is None and self.model_variant != "gamma_matrix":
             self.model_variant = "gamma_matrix"
 
+        if include_gray_ramp_correction:
+            self._fit_gray_correction(df_agg)
+        else:
+            self._set_gray_correction(None, None, neutral_power=self.neutral_power, enabled=False)
+
         return self
 
     def to_dict(self):
@@ -584,6 +729,10 @@ class XYZRGBScreenModel:
             "fit_rmse_xyz": None if self.fit_rmse_xyz is None else self.fit_rmse_xyz.tolist(),
             "trc_code": None if self.trc_code is None else [v.tolist() for v in self.trc_code],
             "trc_linear": None if self.trc_linear is None else [v.tolist() for v in self.trc_linear],
+            "gray_lin": None if self.gray_lin is None else self.gray_lin.tolist(),
+            "gray_delta_xyz": None if self.gray_delta_xyz is None else self.gray_delta_xyz.tolist(),
+            "neutral_power": float(self.neutral_power),
+            "gray_correction_enabled": bool(self.gray_correction_enabled),
         }
 
     @classmethod
@@ -603,6 +752,10 @@ class XYZRGBScreenModel:
             trc_code=params.get("trc_code"),
             trc_linear=params.get("trc_linear"),
             model_variant=params.get("model_variant", "gamma_matrix"),
+            gray_lin=params.get("gray_lin"),
+            gray_delta_xyz=params.get("gray_delta_xyz"),
+            neutral_power=params.get("neutral_power", 2.0),
+            gray_correction_enabled=params.get("gray_correction_enabled", False),
         )
 
     def save_json(self, path):
@@ -622,26 +775,31 @@ class XYZRGBScreenModel:
     def rgb_to_xyz(self, rgb_values):
         rgb, squeeze = self._as_nx3(rgb_values, "rgb_values")
         rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0)
+        rgb_lin = self._rgb_norm_to_lin(rgb_norm, clip=True)
 
-        if self.trc_code is not None:
-            rgb_lin = self._eval_trc_forward(rgb_norm, clip=True)
-        else:
-            rgb_lin = np.power(rgb_norm, self.gamma_rgb[None, :])
-
-        xyz = rgb_lin @ self.M_rgb2xyz + self.black_xyz[None, :]
+        xyz_base = self._base_xyz_from_rgb_lin(rgb_lin)
+        xyz = self._apply_gray_correction_forward(rgb_lin, xyz_base)
         return xyz[0] if squeeze else xyz
 
     def xyz_to_rgb(self, xyz_values, clip=False, as_int=True):
         xyz, squeeze = self._as_nx3(xyz_values, "xyz_values")
-        rgb_lin = (xyz - self.black_xyz[None, :]) @ self.M_xyz2rgb_lin
 
-        if self.trc_code is not None:
-            rgb_norm = self._eval_trc_inverse(rgb_lin, clip=clip)
-            rgb = 255.0 * rgb_norm
-        else:
-            if clip:
-                rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
-            rgb = 255.0 * np.power(np.clip(rgb_lin, 0.0, None), 1.0 / self.gamma_rgb[None, :])
+        rgb_lin = self._base_rgb_lin_from_xyz(xyz)
+        if clip:
+            rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
+
+        if self.gray_correction_enabled and self.gray_lin is not None:
+            for _ in range(4):
+                s = rgb_lin.mean(axis=1)
+                w = self._neutrality_weight(rgb_lin)
+                d = self._gray_delta_from_lin(s)
+                xyz_adj = xyz - w[:, None] * d
+                rgb_lin = self._base_rgb_lin_from_xyz(xyz_adj)
+                if clip:
+                    rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
+
+        rgb_norm = self._lin_to_rgb_norm(rgb_lin, clip=clip)
+        rgb = 255.0 * rgb_norm
 
         if clip:
             rgb = np.clip(rgb, 0.0, 255.0)
