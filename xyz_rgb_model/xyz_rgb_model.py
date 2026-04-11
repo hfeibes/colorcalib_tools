@@ -22,17 +22,17 @@ except:
     import calib_control_funcs as ccf
 
 
-tablet = 'amoled_1'
+tablet = 'amoled_A_sobol'
 data_dir = 'input_files'
-start_with_start_M = True
-start_with_start_gamma = True
+start_with_start_M = False
+start_with_start_gamma = False
 predict_new = False
 
 # Choose training and testing sets
 train_by = 'id' # type or id
 # If train_by = id, train and test must be lists of id numbers in the df, otherwise, color types
-train = list(range(17)) # ['csc_l', 'csc_d', 'csc_lg', 'csc_dg', 'csc_g', 'monochr', 'gray']
-test = list(range(17,65))
+train = list(range(125)) # ['csc_l', 'csc_d', 'csc_lg', 'csc_dg', 'csc_g', 'monochr', 'gray']
+test = list(range(125,150))
 control_point_ids = None #list(range(0,15))
 
 
@@ -44,7 +44,7 @@ data = ccf.average_repeated_measurements(data)
 if start_with_start_M: # Initialize matrix as calibration code would have
     Minv, start_M = ccf.get_starting_M(data)
 else:
-    start_M = None
+    start_M = np.array([[1,1,1],[1,1,1],[1,1,1]])
 if start_with_start_gamma:
     # Get starting gamma params from forward fit of calib data
     calib_r,calib_g,calib_b,calib_w = ccf.split_calib_df(data, drop0=True)
@@ -58,7 +58,8 @@ if start_with_start_gamma:
         pa, pb, pg = ccf.get_starting_gamma(.01,1,2.2,xdat,ydat)
         start_gamma_params.append([pa,pb,pg])
     start_gamma = [start_gamma_params[0][2],start_gamma_params[1][2],start_gamma_params[2][2]]
-else: start_gamma = None
+else: 
+    start_gamma = [0]
     
 
 def train_calib_model(epochs, model, loss_fn, param_optim, train_xyz, train_rgb, 

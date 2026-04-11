@@ -2,7 +2,7 @@
 Convert PR spectra measurements to XYZ values.
 
 This module provides a callable function:
-    convert_spd_csv_to_xyz(input_file, output_file, cmf="cie1931", cmf_file=None)
+    convert_spd_csv_to_xyz(input_file, output_file, cmf="ciejudd", cmf_file=None)
 """
 
 from pathlib import Path
@@ -12,7 +12,7 @@ import pandas as pd
 from scipy.interpolate import CubicSpline
 
 
-DEFAULT_CIE1931_CMF = Path(__file__).resolve().parents[1] / "color_matching_functions" / "ciexyzj.txt"
+DEFAULT_CIEJUDD_CMF = Path(__file__).resolve().parents[1] / "color_matching_functions" / "ciexyzj.txt"
 
 
 def _interp_to_1nm_domain(x, y):
@@ -63,12 +63,12 @@ def common_domain(x1, y1, x2, y2):
     return xc, y1c, y2c
 
 
-def _load_cmf(cmf="cie1931", cmf_file=None):
+def _load_cmf(cmf="ciejudd", cmf_file=None):
     cmf_key = str(cmf).strip().lower()
-    if cmf_key != "cie1931":
-        raise ValueError(f"Unsupported cmf '{cmf}'. Only 'cie1931' is currently supported.")
+    if cmf_key != "ciejudd":
+        raise ValueError(f"Unsupported cmf '{cmf}'. Only 'ciejudd' is currently supported.")
 
-    cmf_path = Path(cmf_file) if cmf_file else DEFAULT_CIE1931_CMF
+    cmf_path = Path(cmf_file) if cmf_file else DEFAULT_CIEJUDD_CMF
     cmf_df = pd.read_csv(
         cmf_path,
         header=None,
@@ -80,7 +80,7 @@ def _load_cmf(cmf="cie1931", cmf_file=None):
     return x, y
 
 
-def convert_spd_csv_to_xyz(input_file, output_file, cmf="cie1931", cmf_file=None):
+def convert_spd_csv_to_xyz(input_file, output_file, cmf="ciejudd", cmf_file=None):
     """
     Convert spectra CSV to XYZ CSV.
 
@@ -90,7 +90,7 @@ def convert_spd_csv_to_xyz(input_file, output_file, cmf="cie1931", cmf_file=None
         Path to spectra CSV with columns: rep, id, r, g, b, nm, power
     output_file : str | Path
         Path to output XYZ CSV.
-    cmf : str, default "cie1931"
+    cmf : str, default "ciejudd"
         Color matching function identifier.
     cmf_file : str | Path | None
         Optional custom CMF file path.
@@ -142,8 +142,8 @@ def main():
     parser.add_argument("output_file", help="Output XYZ CSV path.")
     parser.add_argument(
         "--cmf",
-        default="cie1931",
-        help="Color matching function to use (currently only: cie1931).",
+        default="judd",
+        help="Color matching function to use (currently only: judd).",
     )
     parser.add_argument(
         "--cmf-file",
