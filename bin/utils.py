@@ -4,6 +4,34 @@ import numpy as np
 import json
 from scipy.optimize import minimize, minimize_scalar
 
+XYZ_CMF_DEFAULT = "cie_judd"
+
+
+def _normalize_xyz_cmf(xyz_cmf):
+    """
+    Normalize XYZ CMF identifier.
+
+    Notes
+    -----
+    This project uses CIE Judd-corrected XYZ by default.
+    """
+    key = str(xyz_cmf).strip().lower().replace("-", "").replace("_", "")
+    judd_aliases = {"ciejudd", "judd", "ciejudd1951", "judd1951"}
+    if key in judd_aliases:
+        return "cie_judd"
+
+    cie1931_aliases = {"cie1931", "1931", "ciexyz1931"}
+    if key in cie1931_aliases:
+        raise ValueError(
+            "CIE 1931 XYZ is not supported in this project. "
+            "Use CIE Judd-corrected XYZ."
+        )
+
+    raise ValueError(
+        f"Unsupported xyz_cmf '{xyz_cmf}'. "
+        "Supported identifiers: CIE Judd tags only."
+    )
+
 def summarize_xyz_measurements(files):
     """
     Load one or more CSV files containing columns: id, X, Y, Z.
@@ -72,6 +100,7 @@ def summarize_xyz_measurements(files):
 def xyz_to_cie_luv(
     xyz_values,
     reference_point,
+    xyz_cmf=XYZ_CMF_DEFAULT,
 ):
     """
     Convert one or more XYZ tristimulus values to CIE L*u*v*.
@@ -88,6 +117,12 @@ def xyz_to_cie_luv(
     pandas.DataFrame
         DataFrame with columns: X, Y, Z, L, u, v
     """
+    cmf = _normalize_xyz_cmf(xyz_cmf)
+    if cmf != "cie_judd":
+        raise ValueError(
+            "xyz_to_cie_luv expects CIE Judd-corrected XYZ."
+        )
+
     xyz = np.asarray(xyz_values, dtype=float)
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("xyz_values must be an Nx3 array-like of XYZ values.")
@@ -136,7 +171,7 @@ def xyz_to_cie_luv(
     )
 
 
-def cie_luv_to_xyz(luv_values, reference_point):
+def cie_luv_to_xyz(luv_values, reference_point, xyz_cmf=XYZ_CMF_DEFAULT):
     """
     Convert one or more CIE L*u*v* values to XYZ.
 
@@ -152,6 +187,12 @@ def cie_luv_to_xyz(luv_values, reference_point):
     pandas.DataFrame
         DataFrame with columns: L, u, v, X, Y, Z
     """
+    cmf = _normalize_xyz_cmf(xyz_cmf)
+    if cmf != "cie_judd":
+        raise ValueError(
+            "cie_luv_to_xyz returns CIE Judd-corrected XYZ."
+        )
+
     luv = np.asarray(luv_values, dtype=float)
     if luv.ndim != 2 or luv.shape[1] != 3:
         raise ValueError("luv_values must be an Nx3 array-like of [L, u, v] values.")
@@ -206,84 +247,112 @@ def cie_luv_to_xyz(luv_values, reference_point):
     )
 
 
+class _SigmoidMLP:
+    """Minimal torch MLP: Linear(hidden) -> sigmoid -> Linear(out_dim)."""
+
+    def __init__(self, torch, in_dim, hidden_dim, out_dim):
+        self.torch = torch
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        if self.in_dim < 1:
+            raise ValueError("in_dim must be >= 1.")
+        if self.hidden_dim < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+        if self.out_dim < 1:
+            raise ValueError("out_dim must be >= 1.")
+
+        self.fc1_w = torch.nn.Parameter(torch.empty((self.in_dim, self.hidden_dim), dtype=torch.float32), requires_grad=True)
+        self.fc1_b = torch.nn.Parameter(torch.zeros((self.hidden_dim,), dtype=torch.float32), requires_grad=True)
+        self.fc2_w = torch.nn.Parameter(torch.empty((self.hidden_dim, self.out_dim), dtype=torch.float32), requires_grad=True)
+        self.fc2_b = torch.nn.Parameter(torch.zeros((self.out_dim,), dtype=torch.float32), requires_grad=True)
+
+        # Xavier-like init for stable optimization.
+        torch.nn.init.xavier_uniform_(self.fc1_w)
+        torch.nn.init.xavier_uniform_(self.fc2_w)
+
+    def parameters(self):
+        return [self.fc1_w, self.fc1_b, self.fc2_w, self.fc2_b]
+
+    def state_dict(self):
+        return {
+            "in_dim": self.in_dim,
+            "hidden_dim": self.hidden_dim,
+            "out_dim": self.out_dim,
+            "fc1_w": self.fc1_w.detach().cpu(),
+            "fc1_b": self.fc1_b.detach().cpu(),
+            "fc2_w": self.fc2_w.detach().cpu(),
+            "fc2_b": self.fc2_b.detach().cpu(),
+        }
+
+    def load_state_dict(self, state):
+        T = self.torch
+        with T.no_grad():
+            self.fc1_w.copy_(state["fc1_w"])
+            self.fc1_b.copy_(state["fc1_b"])
+            self.fc2_w.copy_(state["fc2_w"])
+            self.fc2_b.copy_(state["fc2_b"])
+
+    def __call__(self, x_t):
+        T = self.torch
+        h = T.sigmoid(x_t @ self.fc1_w + self.fc1_b[None, :])
+        y = h @ self.fc2_w + self.fc2_b[None, :]
+        return y
+
+
 class XYZRGBScreenModel:
     """
-    Screen model with per-channel nonlinearity and linear RGB<->XYZ transform.
+    Minimal dual-path OLED model with independent fits.
 
-    Base model:
-      rgb_lin = trc(rgb_code / 255)           # or gamma fallback
-      xyz_base = rgb_lin @ M_rgb2xyz + black
+    Architecture:
+      xyz_to_rgb path:
+        XYZ_rel (3) -> Linear(hidden_dim) -> sigmoid -> Linear(3) -> RGB_norm
+      rgb_to_xyz path:
+        RGB_norm (3) -> Linear(hidden_dim_forward) -> sigmoid -> Linear(3) -> XYZ_rel
 
-    Optional grey-ramp correction (enabled by default after fit):
-      xyz = xyz_base + w_neutral(rgb_lin) * delta_gray(mean(rgb_lin))
-
-    This captures neutral-axis color/luminance drift (common on real panels)
-    while preserving colored-point behavior.
+    Notes:
+      - Paths are fitted independently (no coupling constraints).
+      - white_xyz and black_xyz are preserved as required attributes.
     """
 
-    def __init__(
-        self,
-        black_xyz,
-        white_xyz,
-        gamma_rgb=None,
-        M_rgb2xyz=None,
-        fit_rmse_xyz=None,
-        trc_code=None,
-        trc_linear=None,
-        model_variant="gamma_matrix",
-        gray_lin=None,
-        gray_delta_xyz=None,
-        neutral_power=2.0,
-        gray_correction_enabled=False,
-    ):
+    def __init__(self, black_xyz, white_xyz, xyz_cmf=XYZ_CMF_DEFAULT):
         self.black_xyz = np.asarray(black_xyz, dtype=float).reshape(3)
         self.white_xyz = np.asarray(white_xyz, dtype=float).reshape(3)
+        self.xyz_cmf = _normalize_xyz_cmf(xyz_cmf)
+        if self.xyz_cmf != "cie_judd":
+            raise ValueError(
+                "XYZRGBScreenModel currently supports CIE Judd-corrected XYZ only."
+            )
 
-        if gamma_rgb is None:
-            gamma_rgb = np.array([2.2, 2.2, 2.2], dtype=float)
-        self.gamma_rgb = np.asarray(gamma_rgb, dtype=float).reshape(3)
+        self.inverse_model = None
+        self.forward_model = None
+        self.hidden_dim = None
+        self.hidden_dim_forward = None
+        self.inverse_input_mean = np.zeros(3, dtype=float)
+        self.inverse_input_std = np.ones(3, dtype=float)
+        self.forward_input_mean = np.zeros(3, dtype=float)
+        self.forward_input_std = np.ones(3, dtype=float)
+        # Backward-compatible aliases for prior notebooks.
+        self.input_mean = self.inverse_input_mean.copy()
+        self.input_std = self.inverse_input_std.copy()
 
-        if M_rgb2xyz is None:
-            M_rgb2xyz = np.eye(3, dtype=float)
-        self.M_rgb2xyz = np.asarray(M_rgb2xyz, dtype=float).reshape(3, 3)
-        self.M_xyz2rgb_lin = np.linalg.pinv(self.M_rgb2xyz)
-
-        self.fit_rmse_xyz = None if fit_rmse_xyz is None else np.asarray(fit_rmse_xyz, dtype=float).reshape(3)
-
-        self.trc_code = self._normalize_trc_list(trc_code, "trc_code")
-        self.trc_linear = self._normalize_trc_list(trc_linear, "trc_linear")
-        if (self.trc_code is None) != (self.trc_linear is None):
-            raise ValueError("trc_code and trc_linear must either both be provided or both be None.")
-
-        self.model_variant = str(model_variant)
-        if self.trc_code is not None:
-            self.model_variant = "trc_matrix"
-
-        self.gray_lin = None
-        self.gray_delta_xyz = None
-        self.neutral_power = float(neutral_power)
-        self.gray_correction_enabled = bool(gray_correction_enabled)
-        self._set_gray_correction(
-            gray_lin=gray_lin,
-            gray_delta_xyz=gray_delta_xyz,
-            neutral_power=neutral_power,
-            enabled=gray_correction_enabled,
-        )
+        # Kept for notebook compatibility.
+        self.gamma_rgb = np.full(3, np.nan, dtype=float)
+        self.fit_rmse_xyz = np.full(3, np.nan, dtype=float)
+        self.inverse_fit_rmse_rgb = None
+        self.forward_fit_rmse_xyz = None
+        self.model_variant = "unfit"
 
     @staticmethod
-    def _normalize_trc_list(values, name):
-        if values is None:
-            return None
-        if len(values) != 3:
-            raise ValueError(f"{name} must be a list of length 3.")
-
-        out = []
-        for i, arr in enumerate(values):
-            a = np.asarray(arr, dtype=float).ravel()
-            if a.size < 2:
-                raise ValueError(f"{name}[{i}] must have at least 2 points.")
-            out.append(a)
-        return out
+    def _require_torch():
+        try:
+            import torch  # noqa: PLC0415
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                "PyTorch is required for XYZRGBScreenModel fit/save/load. "
+                "Install/fix torch runtime in this environment."
+            ) from exc
+        return torch
 
     @staticmethod
     def _as_nx3(values, name):
@@ -296,173 +365,12 @@ class XYZRGBScreenModel:
             raise ValueError(f"{name} must have shape Nx3.")
         return arr, False
 
-    @staticmethod
-    def _interp_with_extrap(x, xp, fp):
-        x = np.asarray(x, dtype=float)
-        xp = np.asarray(xp, dtype=float)
-        fp = np.asarray(fp, dtype=float)
+    def _xyz_span(self):
+        return np.maximum(self.white_xyz - self.black_xyz, 1e-8)
 
-        if xp.ndim != 1 or fp.ndim != 1 or xp.size != fp.size or xp.size < 2:
-            raise ValueError("xp/fp must be 1D arrays with same length >= 2.")
-
-        y = np.interp(x, xp, fp)
-
-        dx0 = xp[1] - xp[0]
-        dx1 = xp[-1] - xp[-2]
-        s0 = (fp[1] - fp[0]) / dx0 if abs(dx0) > 1e-12 else 0.0
-        s1 = (fp[-1] - fp[-2]) / dx1 if abs(dx1) > 1e-12 else 0.0
-
-        below = x < xp[0]
-        above = x > xp[-1]
-        if np.any(below):
-            y[below] = fp[0] + (x[below] - xp[0]) * s0
-        if np.any(above):
-            y[above] = fp[-1] + (x[above] - xp[-1]) * s1
-
-        return y
-
-    def _set_matrix(self, M_rgb2xyz):
-        self.M_rgb2xyz = np.asarray(M_rgb2xyz, dtype=float).reshape(3, 3)
-        self.M_xyz2rgb_lin = np.linalg.pinv(self.M_rgb2xyz)
-
-    def _set_trc(self, trc_code, trc_linear):
-        self.trc_code = self._normalize_trc_list(trc_code, "trc_code")
-        self.trc_linear = self._normalize_trc_list(trc_linear, "trc_linear")
-        if (self.trc_code is None) != (self.trc_linear is None):
-            raise ValueError("trc_code and trc_linear must either both be provided or both be None.")
-        if self.trc_code is not None:
-            self.model_variant = "trc_matrix"
-
-    def _set_gray_correction(self, gray_lin=None, gray_delta_xyz=None, neutral_power=2.0, enabled=False):
-        self.neutral_power = float(neutral_power)
-        self.gray_correction_enabled = bool(enabled)
-
-        if gray_lin is None or gray_delta_xyz is None:
-            self.gray_lin = None
-            self.gray_delta_xyz = None
-            self.gray_correction_enabled = False
-            return
-
-        lin = np.asarray(gray_lin, dtype=float).ravel()
-        delta = np.asarray(gray_delta_xyz, dtype=float)
-        if delta.ndim != 2 or delta.shape[1] != 3:
-            raise ValueError("gray_delta_xyz must have shape Nx3.")
-        if lin.size != delta.shape[0] or lin.size < 2:
-            raise ValueError("gray_lin and gray_delta_xyz must have matching length >= 2.")
-
-        order = np.argsort(lin)
-        lin = lin[order]
-        delta = delta[order]
-
-        tmp = pd.DataFrame({"lin": lin, "dx": delta[:, 0], "dy": delta[:, 1], "dz": delta[:, 2]})
-        tmp = tmp.groupby("lin", as_index=False)[["dx", "dy", "dz"]].mean().sort_values("lin")
-
-        lin = tmp["lin"].to_numpy(dtype=float)
-        delta = tmp[["dx", "dy", "dz"]].to_numpy(dtype=float)
-
-        # Anchor black correction to zero.
-        if lin[0] > 0.0:
-            lin = np.r_[0.0, lin]
-            delta = np.vstack([np.zeros((1, 3), dtype=float), delta])
-        else:
-            lin[0] = 0.0
-            delta[0] = 0.0
-
-        self.gray_lin = lin
-        self.gray_delta_xyz = delta
-        self.gray_correction_enabled = bool(enabled)
-
-    def _eval_trc_forward(self, rgb_norm, clip=True):
-        out = np.zeros_like(rgb_norm, dtype=float)
-        for c in range(3):
-            xp = self.trc_code[c]
-            fp = self.trc_linear[c]
-            x = np.asarray(rgb_norm[:, c], dtype=float)
-            if clip:
-                x = np.clip(x, xp[0], xp[-1])
-                out[:, c] = np.interp(x, xp, fp)
-            else:
-                out[:, c] = self._interp_with_extrap(x, xp, fp)
-        return out
-
-    def _eval_trc_inverse(self, rgb_lin, clip=True):
-        out = np.zeros_like(rgb_lin, dtype=float)
-        for c in range(3):
-            xp = self.trc_linear[c]
-            fp = self.trc_code[c]
-
-            xp_u, idx = np.unique(xp, return_index=True)
-            fp_u = fp[idx]
-            if xp_u.size < 2:
-                raise ValueError("TRC inverse is degenerate; not enough unique linear points.")
-
-            x = np.asarray(rgb_lin[:, c], dtype=float)
-            if clip:
-                x = np.clip(x, xp_u[0], xp_u[-1])
-                out[:, c] = np.interp(x, xp_u, fp_u)
-            else:
-                out[:, c] = self._interp_with_extrap(x, xp_u, fp_u)
-        return out
-
-    def _rgb_norm_to_lin(self, rgb_norm, clip=True):
-        if self.trc_code is not None:
-            return self._eval_trc_forward(rgb_norm, clip=clip)
-        if clip:
-            rgb_norm = np.clip(rgb_norm, 0.0, 1.0)
-        return np.power(np.clip(rgb_norm, 0.0, None), self.gamma_rgb[None, :])
-
-    def _lin_to_rgb_norm(self, rgb_lin, clip=True):
-        if self.trc_code is not None:
-            return self._eval_trc_inverse(rgb_lin, clip=clip)
-        if clip:
-            rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
-        return np.power(np.clip(rgb_lin, 0.0, None), 1.0 / self.gamma_rgb[None, :])
-
-    def _base_xyz_from_rgb_lin(self, rgb_lin):
-        return rgb_lin @ self.M_rgb2xyz + self.black_xyz[None, :]
-
-    def _base_rgb_lin_from_xyz(self, xyz):
-        return (xyz - self.black_xyz[None, :]) @ self.M_xyz2rgb_lin
-
-    def _neutrality_weight(self, rgb_lin):
-        rgb_lin = np.asarray(rgb_lin, dtype=float)
-        spread = rgb_lin.max(axis=1) - rgb_lin.min(axis=1)
-        amp = np.maximum(rgb_lin.max(axis=1), 1e-8)
-        neutrality = np.clip(1.0 - spread / amp, 0.0, 1.0)
-        return np.power(neutrality, self.neutral_power)
-
-    def _gray_delta_from_lin(self, s_lin):
-        if self.gray_lin is None or self.gray_delta_xyz is None:
-            return np.zeros((len(np.asarray(s_lin).ravel()), 3), dtype=float)
-        s = np.asarray(s_lin, dtype=float).ravel()
-        out = np.zeros((s.size, 3), dtype=float)
-        for j in range(3):
-            out[:, j] = np.interp(s, self.gray_lin, self.gray_delta_xyz[:, j])
-        return out
-
-    def _apply_gray_correction_forward(self, rgb_lin, xyz_base):
-        if not self.gray_correction_enabled or self.gray_lin is None:
-            return xyz_base
-        s = rgb_lin.mean(axis=1)
-        w = self._neutrality_weight(rgb_lin)
-        d = self._gray_delta_from_lin(s)
-        return xyz_base + w[:, None] * d
-
-    def _estimate_effective_gamma(self, trc_code, trc_linear):
-        gammas = []
-        for c in range(3):
-            x = np.asarray(trc_code[c], dtype=float)
-            y = np.asarray(trc_linear[c], dtype=float)
-            mask = (x > 1e-4) & (x < 0.9999) & (y > 1e-6) & (y < 0.9999)
-            if np.count_nonzero(mask) < 3:
-                gammas.append(2.2)
-                continue
-            g_vals = np.log(y[mask]) / np.log(x[mask])
-            g = float(np.nanmedian(g_vals))
-            if not np.isfinite(g):
-                g = 2.2
-            gammas.append(float(np.clip(g, 0.5, 6.0)))
-        return np.asarray(gammas, dtype=float)
+    def _xyz_to_relative(self, xyz):
+        xyz = np.asarray(xyz, dtype=float)
+        return (xyz - self.black_xyz[None, :]) / self._xyz_span()[None, :]
 
     def _prepare_calibration_df(self, calibration_data):
         if isinstance(calibration_data, (str, Path)):
@@ -477,328 +385,344 @@ class XYZRGBScreenModel:
 
         for c in ["r", "g", "b", "X", "Y", "Z"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+        if "id" in df.columns:
+            df["id"] = pd.to_numeric(df["id"], errors="coerce")
+        else:
+            df["id"] = np.nan
+
         df = df.dropna(subset=["r", "g", "b", "X", "Y", "Z"]).copy()
+        # Drop known sentinel/invalid rows used by measurement scripts.
+        df = df[(df["X"] != -1) & (df["Y"] != -1) & (df["Z"] != -1)].copy()
+        df = df[(df["r"] >= 0) & (df["g"] >= 0) & (df["b"] >= 0)].copy()
+        df = df[(df["r"] <= 255) & (df["g"] <= 255) & (df["b"] <= 255)].copy()
+        for c in ["r", "g", "b", "X", "Y", "Z"]:
+            df = df[np.isfinite(df[c])].copy()
         if df.empty:
             raise ValueError("No valid calibration rows after numeric coercion and NaN removal.")
+        return df.reset_index(drop=True)
 
-        df_agg = (
-            df.groupby(["r", "g", "b"], as_index=False)[["X", "Y", "Z"]]
-            .mean()
-            .sort_values(["r", "g", "b"])
-            .reset_index(drop=True)
-        )
-        return df_agg
+    def _build_inverse_model(self, hidden_dim):
+        torch = self._require_torch()
+        return _SigmoidMLP(torch=torch, in_dim=3, hidden_dim=int(hidden_dim), out_dim=3)
 
-    def _fit_gamma_matrix(self, df_agg, gamma_init=(2.2, 2.2, 2.2), gamma_bounds=(0.8, 4.0), max_iter=2000):
-        rgb_code = df_agg[["r", "g", "b"]].to_numpy(dtype=float)
-        rgb_norm = np.clip(rgb_code / 255.0, 0.0, 1.0)
-        xyz = df_agg[["X", "Y", "Z"]].to_numpy(dtype=float)
-        xyz_corr = np.clip(xyz - self.black_xyz[None, :], 0.0, None)
+    def _build_forward_model(self, hidden_dim):
+        torch = self._require_torch()
+        return _SigmoidMLP(torch=torch, in_dim=3, hidden_dim=int(hidden_dim), out_dim=3)
 
-        g0 = np.asarray(gamma_init, dtype=float).reshape(3)
-        lo, hi = float(gamma_bounds[0]), float(gamma_bounds[1])
-        if lo <= 0 or hi <= lo:
-            raise ValueError("gamma_bounds must satisfy 0 < lower < upper.")
+    def _fit_mlp_path(
+        self,
+        model,
+        x_t,
+        y_t,
+        w_t,
+        pm_t,
+        privileged_weight,
+        nonlinear_reg_strength,
+        torch_lr,
+        nonlinear_max_iter,
+        torch_verbose,
+        tag,
+    ):
+        torch = self._require_torch()
+        optim = torch.optim.Adam(model.parameters(), lr=float(torch_lr))
 
-        log_lo, log_hi = np.log(lo), np.log(hi)
-        x0 = np.log(np.clip(g0, lo, hi))
-        bounds = [(log_lo, log_hi)] * 3
+        best_loss = None
+        best_state = None
+        n_steps = int(max(1, nonlinear_max_iter))
 
-        def _objective(log_g):
-            gamma = np.exp(log_g)
-            rgb_lin = np.power(rgb_norm, gamma[None, :])
-            M, *_ = np.linalg.lstsq(rgb_lin, xyz_corr, rcond=None)
-            pred = rgb_lin @ M
-            err = pred - xyz_corr
-            return float(np.mean(err * err))
+        for step in range(n_steps):
+            optim.zero_grad(set_to_none=True)
+            pred = model(x_t)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
 
-        res = minimize(
-            _objective,
-            x0=x0,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": int(max_iter)},
-        )
-
-        gamma = np.exp(res.x)
-        rgb_lin = np.power(rgb_norm, gamma[None, :])
-        M_rgb2xyz, *_ = np.linalg.lstsq(rgb_lin, xyz_corr, rcond=None)
-        pred = rgb_lin @ M_rgb2xyz
-        fit_rmse_xyz = np.sqrt(np.mean((pred - xyz_corr) ** 2, axis=0))
-
-        return {
-            "variant": "gamma_matrix",
-            "gamma_rgb": gamma,
-            "M_rgb2xyz": M_rgb2xyz,
-            "fit_rmse_xyz": fit_rmse_xyz,
-            "trc_code": None,
-            "trc_linear": None,
-        }
-
-    def _fit_trc_matrix(self, df_agg):
-        rgb_code = df_agg[["r", "g", "b"]].to_numpy(dtype=float)
-        xyz = df_agg[["X", "Y", "Z"]].to_numpy(dtype=float)
-        xyz_corr = np.clip(xyz - self.black_xyz[None, :], 0.0, None)
-
-        chan = ["r", "g", "b"]
-        trc_code = []
-        trc_linear = []
-
-        for c, name in enumerate(chan):
-            other = [v for v in chan if v != name]
-            ramp = df_agg.loc[(df_agg[other[0]] == 0) & (df_agg[other[1]] == 0), [name, "X", "Y", "Z"]].copy()
-            ramp = ramp.groupby(name, as_index=False)[["X", "Y", "Z"]].mean().sort_values(name)
-
-            if len(ramp) < 4:
-                raise ValueError(f"Not enough single-channel ramp points for {name.upper()} channel.")
-
-            code = np.clip(ramp[name].to_numpy(dtype=float) / 255.0, 0.0, 1.0)
-            ramp_xyz_corr = np.clip(ramp[["X", "Y", "Z"]].to_numpy(dtype=float) - self.black_xyz[None, :], 0.0, None)
-
-            if code[0] > 0:
-                code = np.r_[0.0, code]
-                ramp_xyz_corr = np.vstack([np.zeros((1, 3), dtype=float), ramp_xyz_corr])
-
-            direction = ramp_xyz_corr[-1]
-            dnorm2 = float(direction @ direction)
-            if dnorm2 <= 1e-14:
-                raise ValueError(f"Degenerate single-channel ramp for {name.upper()}.")
-
-            scalar = (ramp_xyz_corr @ direction) / dnorm2
-            scalar = np.clip(scalar, 0.0, None)
-            scalar = np.maximum.accumulate(scalar)
-            scalar = scalar - scalar[0]
-            if scalar[-1] <= 1e-12:
-                raise ValueError(f"Non-varying TRC for {name.upper()}.")
-
-            scalar = scalar / scalar[-1]
-            scalar = np.clip(scalar, 0.0, 1.0)
-            code[0] = 0.0
-            scalar[0] = 0.0
-
-            if code[-1] < 1.0:
-                code = np.r_[code, 1.0]
-                scalar = np.r_[scalar, 1.0]
+            data_term = (w_t * ((pred - y_t) ** 2)).mean()
+            if float(privileged_weight) > 0.0:
+                l1 = torch.abs(pred - y_t)
+                denom = torch.clamp(pm_t.sum(), min=1.0)
+                privileged_term = (pm_t * l1).sum() / (denom * y_t.shape[1])
             else:
-                code[-1] = 1.0
-                scalar[-1] = 1.0
+                privileged_term = 0.0 * data_term
 
-            tmp = (
-                pd.DataFrame({"code": code, "lin": scalar})
-                .groupby("code", as_index=False)["lin"]
-                .max()
-                .sort_values("code")
-            )
-            code = tmp["code"].to_numpy(dtype=float)
-            scalar = np.maximum.accumulate(tmp["lin"].to_numpy(dtype=float))
-            scalar = np.clip(scalar, 0.0, 1.0)
+            reg = 0.0
+            for p in model.parameters():
+                reg = reg + torch.mean(p * p)
 
-            if np.unique(scalar).size < 2:
-                raise ValueError(f"Degenerate monotonic TRC for {name.upper()}.")
+            loss = data_term + float(privileged_weight) * privileged_term + float(nonlinear_reg_strength) * reg
+            if not torch.isfinite(loss):
+                if best_state is not None:
+                    model.load_state_dict(best_state)
+                    break
+                raise RuntimeError(f"Non-finite loss during {tag} fit.")
 
-            trc_code.append(code)
-            trc_linear.append(scalar)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optim.step()
 
-        rgb_norm = np.clip(rgb_code / 255.0, 0.0, 1.0)
-        rgb_lin = np.zeros_like(rgb_norm, dtype=float)
-        for c in range(3):
-            rgb_lin[:, c] = np.interp(rgb_norm[:, c], trc_code[c], trc_linear[c])
+            any_bad = False
+            for p in model.parameters():
+                if not torch.isfinite(p).all():
+                    any_bad = True
+                    break
+            if any_bad:
+                if best_state is not None:
+                    model.load_state_dict(best_state)
+                    break
+                raise RuntimeError(f"Non-finite parameter encountered during {tag} fit.")
 
-        M_rgb2xyz, *_ = np.linalg.lstsq(rgb_lin, xyz_corr, rcond=None)
-        pred = rgb_lin @ M_rgb2xyz
-        fit_rmse_xyz = np.sqrt(np.mean((pred - xyz_corr) ** 2, axis=0))
-        gamma_eff = self._estimate_effective_gamma(trc_code, trc_linear)
+            lv = float(loss.detach().cpu())
+            if best_loss is None or lv < best_loss:
+                best_loss = lv
+                best_state = model.state_dict()
 
-        return {
-            "variant": "trc_matrix",
-            "gamma_rgb": gamma_eff,
-            "M_rgb2xyz": M_rgb2xyz,
-            "fit_rmse_xyz": fit_rmse_xyz,
-            "trc_code": trc_code,
-            "trc_linear": trc_linear,
-        }
+            if torch_verbose and ((step + 1) % max(1, n_steps // 10) == 0 or step == 0):
+                print(f"[torch-fit:{tag}] step={step+1}/{n_steps} loss={lv:.8f}")
 
-    def _fit_gray_correction(self, df_agg):
-        grey = df_agg.loc[(df_agg["r"] == df_agg["g"]) & (df_agg["g"] == df_agg["b"]), ["r", "g", "b", "X", "Y", "Z"]].copy()
-        if len(grey) < 4:
-            self._set_gray_correction(None, None, neutral_power=self.neutral_power, enabled=False)
-            return
-
-        grey = grey.sort_values("r").reset_index(drop=True)
-        rgb = grey[["r", "g", "b"]].to_numpy(dtype=float)
-        rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0)
-        rgb_lin = self._rgb_norm_to_lin(rgb_norm, clip=True)
-
-        xyz_meas = grey[["X", "Y", "Z"]].to_numpy(dtype=float)
-        xyz_base = self._base_xyz_from_rgb_lin(rgb_lin)
-        delta = xyz_meas - xyz_base
-
-        s = rgb_lin.mean(axis=1)
-        tmp = (
-            pd.DataFrame({"lin": s, "dx": delta[:, 0], "dy": delta[:, 1], "dz": delta[:, 2]})
-            .groupby("lin", as_index=False)[["dx", "dy", "dz"]]
-            .mean()
-            .sort_values("lin")
-        )
-
-        lin = tmp["lin"].to_numpy(dtype=float)
-        d = tmp[["dx", "dy", "dz"]].to_numpy(dtype=float)
-
-        # Force black endpoint correction to zero.
-        if lin[0] > 0.0:
-            lin = np.r_[0.0, lin]
-            d = np.vstack([np.zeros((1, 3), dtype=float), d])
-        else:
-            lin[0] = 0.0
-            d[0] = 0.0
-
-        self._set_gray_correction(lin, d, neutral_power=self.neutral_power, enabled=True)
+        if best_state is None:
+            raise RuntimeError(f"{tag} fit failed to produce a valid checkpoint.")
+        model.load_state_dict(best_state)
+        return model
 
     def fit(
         self,
         calibration_data,
-        gamma_init=(2.2, 2.2, 2.2),
-        gamma_bounds=(0.8, 4.0),
-        max_iter=2000,
-        mode="auto",
-        include_gray_ramp_correction=True,
-        neutral_power=2.0,
+        fit_inverse_model=True,
+        fit_forward_model=False,
+        privileged_ids=None,
+        privileged_weight=0.0,
+        hidden_dim=8,
+        hidden_dim_forward=None,
+        nonlinear_max_iter=18000,
+        nonlinear_reg_strength=1e-4,
+        torch_lr=1e-3,
+        torch_verbose=False,
+        **_unused,
     ):
-        """
-        Fit model from calibration measurements with columns: r, g, b, X, Y, Z.
+        if not fit_inverse_model and not fit_forward_model:
+            raise ValueError("At least one of fit_inverse_model or fit_forward_model must be True.")
 
-        Parameters
-        ----------
-        calibration_data : pandas.DataFrame | str | Path
-            Calibration table or CSV path.
-        gamma_init : tuple[float, float, float]
-            Initial (gamma_R, gamma_G, gamma_B) used by gamma fallback.
-        gamma_bounds : tuple[float, float]
-            Shared lower/upper bounds for each gamma (gamma fallback).
-        max_iter : int
-            Maximum optimizer iterations for gamma fallback.
-        mode : str
-            One of: "auto", "trc_matrix", "gamma_matrix".
-        include_gray_ramp_correction : bool
-            If True, fit neutral-axis correction from the measured grey ramp.
-        neutral_power : float
-            Exponent controlling how strongly correction is restricted to neutral colors.
-        """
-        mode = str(mode).lower()
-        if mode not in {"auto", "trc_matrix", "gamma_matrix"}:
-            raise ValueError("mode must be one of: 'auto', 'trc_matrix', 'gamma_matrix'.")
+        df = self._prepare_calibration_df(calibration_data)
+        xyz = df[["X", "Y", "Z"]].to_numpy(dtype=float)
+        xyz_rel = self._xyz_to_relative(xyz)
+        rgb_norm = np.clip(df[["r", "g", "b"]].to_numpy(dtype=float) / 255.0, 0.0, 1.0)
 
-        self.neutral_power = float(neutral_power)
+        torch = self._require_torch()
 
-        df_agg = self._prepare_calibration_df(calibration_data)
-
-        if mode == "gamma_matrix":
-            fit_out = self._fit_gamma_matrix(df_agg, gamma_init=gamma_init, gamma_bounds=gamma_bounds, max_iter=max_iter)
-        elif mode == "trc_matrix":
-            fit_out = self._fit_trc_matrix(df_agg)
+        if privileged_ids is None:
+            privileged_mask = np.zeros(len(df), dtype=bool)
         else:
-            try:
-                fit_out = self._fit_trc_matrix(df_agg)
-            except Exception:
-                fit_out = self._fit_gamma_matrix(df_agg, gamma_init=gamma_init, gamma_bounds=gamma_bounds, max_iter=max_iter)
+            priv = set(np.asarray(list(privileged_ids), dtype=float).tolist())
+            privileged_mask = df["id"].isin(priv).to_numpy(dtype=bool)
+        sample_w = np.ones(len(df), dtype=float)
 
-        self.model_variant = fit_out["variant"]
-        self.gamma_rgb = np.asarray(fit_out["gamma_rgb"], dtype=float).reshape(3)
-        self._set_matrix(fit_out["M_rgb2xyz"])
-        self.fit_rmse_xyz = np.asarray(fit_out["fit_rmse_xyz"], dtype=float).reshape(3)
-        self._set_trc(fit_out.get("trc_code"), fit_out.get("trc_linear"))
+        w_t = torch.tensor(sample_w[:, None], dtype=torch.float32)
+        pm_t = torch.tensor(privileged_mask[:, None], dtype=torch.float32)
 
-        if self.trc_code is None and self.model_variant != "gamma_matrix":
-            self.model_variant = "gamma_matrix"
+        if fit_inverse_model:
+            self.inverse_input_mean = np.mean(xyz_rel, axis=0)
+            self.inverse_input_std = np.std(xyz_rel, axis=0)
+            self.inverse_input_std = np.where(self.inverse_input_std > 1e-6, self.inverse_input_std, 1.0)
+            self.input_mean = self.inverse_input_mean.copy()
+            self.input_std = self.inverse_input_std.copy()
+            x_inv = (xyz_rel - self.inverse_input_mean[None, :]) / self.inverse_input_std[None, :]
+            x_inv_t = torch.tensor(x_inv, dtype=torch.float32)
+            y_inv_t = torch.tensor(rgb_norm, dtype=torch.float32)
 
-        if include_gray_ramp_correction:
-            self._fit_gray_correction(df_agg)
+            self.hidden_dim = int(hidden_dim)
+            self.inverse_model = self._build_inverse_model(self.hidden_dim)
+            self.inverse_model = self._fit_mlp_path(
+                model=self.inverse_model,
+                x_t=x_inv_t,
+                y_t=y_inv_t,
+                w_t=w_t,
+                pm_t=pm_t,
+                privileged_weight=privileged_weight,
+                nonlinear_reg_strength=nonlinear_reg_strength,
+                torch_lr=torch_lr,
+                nonlinear_max_iter=nonlinear_max_iter,
+                torch_verbose=torch_verbose,
+                tag="xyz_to_rgb_mlp",
+            )
+
+            pred_rgb = self._predict_inverse(xyz)
+            self.inverse_fit_rmse_rgb = np.sqrt(np.mean((pred_rgb - rgb_norm) ** 2, axis=0))
+
+        if fit_forward_model:
+            if hidden_dim_forward is None:
+                hidden_dim_forward = hidden_dim
+            self.forward_input_mean = np.mean(rgb_norm, axis=0)
+            self.forward_input_std = np.std(rgb_norm, axis=0)
+            self.forward_input_std = np.where(self.forward_input_std > 1e-6, self.forward_input_std, 1.0)
+            x_fwd = (rgb_norm - self.forward_input_mean[None, :]) / self.forward_input_std[None, :]
+            x_fwd_t = torch.tensor(x_fwd, dtype=torch.float32)
+            y_fwd_t = torch.tensor(xyz_rel, dtype=torch.float32)
+
+            self.hidden_dim_forward = int(hidden_dim_forward)
+            self.forward_model = self._build_forward_model(self.hidden_dim_forward)
+            self.forward_model = self._fit_mlp_path(
+                model=self.forward_model,
+                x_t=x_fwd_t,
+                y_t=y_fwd_t,
+                w_t=w_t,
+                pm_t=pm_t,
+                privileged_weight=privileged_weight,
+                nonlinear_reg_strength=nonlinear_reg_strength,
+                torch_lr=torch_lr,
+                nonlinear_max_iter=nonlinear_max_iter,
+                torch_verbose=torch_verbose,
+                tag="rgb_to_xyz_mlp",
+            )
+
+            pred_xyz = self.rgb_to_xyz(df[["r", "g", "b"]].to_numpy(dtype=float), clip=False)
+            self.forward_fit_rmse_xyz = np.sqrt(np.mean((pred_xyz - xyz) ** 2, axis=0))
+
+        self.gamma_rgb = np.full(3, np.nan, dtype=float)
+        self.fit_rmse_xyz = np.full(3, np.nan, dtype=float)
+        if fit_inverse_model and fit_forward_model:
+            self.model_variant = "dual_mlp_sigmoid_hidden"
+        elif fit_inverse_model:
+            self.model_variant = "xyz_to_rgb_mlp_sigmoid_hidden"
         else:
-            self._set_gray_correction(None, None, neutral_power=self.neutral_power, enabled=False)
-
+            self.model_variant = "rgb_to_xyz_mlp_sigmoid_hidden"
         return self
 
-    def to_dict(self):
+    def _predict_inverse(self, xyz):
+        if self.inverse_model is None:
+            raise RuntimeError(
+                "xyz_to_rgb requires a fitted/loaded inverse model. "
+                "Call fit(..., fit_inverse_model=True) or load_state(...)."
+            )
+        torch = self._require_torch()
+        x = self._xyz_to_relative(np.asarray(xyz, dtype=float))
+        if x.ndim != 2 or x.shape[1] != 3:
+            raise ValueError("xyz must have shape Nx3.")
+        x = (x - self.inverse_input_mean[None, :]) / self.inverse_input_std[None, :]
+
+        with torch.inference_mode():
+            x_t = torch.tensor(x, dtype=torch.float32)
+            pred = self.inverse_model(x_t).detach().cpu().numpy().astype(float)
+
+        pred = np.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
+        return pred
+
+    def _predict_forward_relative(self, rgb):
+        if self.forward_model is None:
+            raise RuntimeError(
+                "rgb_to_xyz requires a fitted/loaded forward model. "
+                "Call fit(..., fit_forward_model=True) or load_state(...)."
+            )
+        torch = self._require_torch()
+        rgb_norm = np.asarray(rgb, dtype=float) / 255.0
+        if rgb_norm.ndim != 2 or rgb_norm.shape[1] != 3:
+            raise ValueError("rgb must have shape Nx3.")
+        rgb_norm = np.clip(rgb_norm, 0.0, 1.0)
+        x = (rgb_norm - self.forward_input_mean[None, :]) / self.forward_input_std[None, :]
+
+        with torch.inference_mode():
+            x_t = torch.tensor(x, dtype=torch.float32)
+            pred_rel = self.forward_model(x_t).detach().cpu().numpy().astype(float)
+
+        pred_rel = np.nan_to_num(pred_rel, nan=0.0, posinf=1.0, neginf=0.0)
+        return pred_rel
+
+    def state_dict(self):
         return {
             "model_type": "XYZRGBScreenModel",
-            "model_variant": self.model_variant,
+            "state_format": "XYZRGBScreenModel.dual_mlp.v1",
+            "xyz_cmf": self.xyz_cmf,
             "black_xyz": self.black_xyz.tolist(),
             "white_xyz": self.white_xyz.tolist(),
+            "hidden_dim": self.hidden_dim,
+            "hidden_dim_forward": self.hidden_dim_forward,
+            "input_mean": self.inverse_input_mean.tolist(),
+            "input_std": self.inverse_input_std.tolist(),
+            "inverse_input_mean": self.inverse_input_mean.tolist(),
+            "inverse_input_std": self.inverse_input_std.tolist(),
+            "forward_input_mean": self.forward_input_mean.tolist(),
+            "forward_input_std": self.forward_input_std.tolist(),
             "gamma_rgb": self.gamma_rgb.tolist(),
-            "M_rgb2xyz": self.M_rgb2xyz.tolist(),
-            "fit_rmse_xyz": None if self.fit_rmse_xyz is None else self.fit_rmse_xyz.tolist(),
-            "trc_code": None if self.trc_code is None else [v.tolist() for v in self.trc_code],
-            "trc_linear": None if self.trc_linear is None else [v.tolist() for v in self.trc_linear],
-            "gray_lin": None if self.gray_lin is None else self.gray_lin.tolist(),
-            "gray_delta_xyz": None if self.gray_delta_xyz is None else self.gray_delta_xyz.tolist(),
-            "neutral_power": float(self.neutral_power),
-            "gray_correction_enabled": bool(self.gray_correction_enabled),
+            "fit_rmse_xyz": self.fit_rmse_xyz.tolist(),
+            "inverse_fit_rmse_rgb": None if self.inverse_fit_rmse_rgb is None else self.inverse_fit_rmse_rgb.tolist(),
+            "forward_fit_rmse_xyz": None if self.forward_fit_rmse_xyz is None else self.forward_fit_rmse_xyz.tolist(),
+            "model_variant": self.model_variant,
+            "inverse_model_state": None if self.inverse_model is None else self.inverse_model.state_dict(),
+            "forward_model_state": None if self.forward_model is None else self.forward_model.state_dict(),
         }
 
-    @classmethod
-    def from_dict(cls, params):
-        required = {"black_xyz", "white_xyz", "M_rgb2xyz"}
-        missing = required - set(params.keys())
-        if missing:
-            raise ValueError(f"Model parameters missing required keys: {sorted(missing)}")
-
-        gamma_rgb = params.get("gamma_rgb", [2.2, 2.2, 2.2])
-        return cls(
-            black_xyz=params["black_xyz"],
-            white_xyz=params["white_xyz"],
-            gamma_rgb=gamma_rgb,
-            M_rgb2xyz=params["M_rgb2xyz"],
-            fit_rmse_xyz=params.get("fit_rmse_xyz"),
-            trc_code=params.get("trc_code"),
-            trc_linear=params.get("trc_linear"),
-            model_variant=params.get("model_variant", "gamma_matrix"),
-            gray_lin=params.get("gray_lin"),
-            gray_delta_xyz=params.get("gray_delta_xyz"),
-            neutral_power=params.get("neutral_power", 2.0),
-            gray_correction_enabled=params.get("gray_correction_enabled", False),
-        )
-
-    def save_json(self, path):
+    def save_state(self, path):
+        torch = self._require_torch()
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        torch.save(self.state_dict(), out_path)
         return out_path
 
     @classmethod
-    def load_json(cls, path):
-        in_path = Path(path)
-        with open(in_path, "r", encoding="utf-8") as f:
-            params = json.load(f)
-        return cls.from_dict(params)
+    def load_state(cls, path):
+        torch = cls._require_torch()
+        state = torch.load(Path(path), map_location="cpu")
 
-    def rgb_to_xyz(self, rgb_values):
+        model = cls(
+            black_xyz=state["black_xyz"],
+            white_xyz=state["white_xyz"],
+            xyz_cmf=state.get("xyz_cmf", XYZ_CMF_DEFAULT),
+        )
+
+        h_inv = state.get("hidden_dim", None)
+        model.hidden_dim = None if h_inv is None else int(h_inv)
+        h_fwd = state.get("hidden_dim_forward", None)
+        model.hidden_dim_forward = None if h_fwd is None else int(h_fwd)
+        model.inverse_input_mean = np.asarray(
+            state.get("inverse_input_mean", state.get("input_mean", [0.0, 0.0, 0.0])),
+            dtype=float,
+        )
+        model.inverse_input_std = np.asarray(
+            state.get("inverse_input_std", state.get("input_std", [1.0, 1.0, 1.0])),
+            dtype=float,
+        )
+        model.inverse_input_std = np.where(model.inverse_input_std > 1e-6, model.inverse_input_std, 1.0)
+        model.forward_input_mean = np.asarray(state.get("forward_input_mean", [0.0, 0.0, 0.0]), dtype=float)
+        model.forward_input_std = np.asarray(state.get("forward_input_std", [1.0, 1.0, 1.0]), dtype=float)
+        model.forward_input_std = np.where(model.forward_input_std > 1e-6, model.forward_input_std, 1.0)
+        model.input_mean = model.inverse_input_mean.copy()
+        model.input_std = model.inverse_input_std.copy()
+        model.gamma_rgb = np.asarray(state.get("gamma_rgb", [np.nan, np.nan, np.nan]), dtype=float)
+        model.fit_rmse_xyz = np.asarray(state.get("fit_rmse_xyz", [np.nan, np.nan, np.nan]), dtype=float)
+        inv_rmse = state.get("inverse_fit_rmse_rgb")
+        model.inverse_fit_rmse_rgb = None if inv_rmse is None else np.asarray(inv_rmse, dtype=float)
+        fwd_rmse = state.get("forward_fit_rmse_xyz")
+        model.forward_fit_rmse_xyz = None if fwd_rmse is None else np.asarray(fwd_rmse, dtype=float)
+        model.model_variant = state.get("model_variant", "loaded")
+
+        inv_state = state.get("inverse_model_state")
+        if inv_state is not None:
+            model.inverse_model = model._build_inverse_model(model.hidden_dim)
+            model.inverse_model.load_state_dict(inv_state)
+        else:
+            model.inverse_model = None
+
+        fwd_state = state.get("forward_model_state")
+        if fwd_state is not None:
+            if model.hidden_dim_forward is None:
+                model.hidden_dim_forward = int(fwd_state.get("hidden_dim", model.hidden_dim or 8))
+            model.forward_model = model._build_forward_model(model.hidden_dim_forward)
+            model.forward_model.load_state_dict(fwd_state)
+        else:
+            model.forward_model = None
+
+        if model.inverse_model is None and model.forward_model is None:
+            raise ValueError("Loaded state does not contain inverse_model_state or forward_model_state.")
+        return model
+
+    def rgb_to_xyz(self, rgb_values, clip=False):
         rgb, squeeze = self._as_nx3(rgb_values, "rgb_values")
-        rgb_norm = np.clip(rgb / 255.0, 0.0, 1.0)
-        rgb_lin = self._rgb_norm_to_lin(rgb_norm, clip=True)
-
-        xyz_base = self._base_xyz_from_rgb_lin(rgb_lin)
-        xyz = self._apply_gray_correction_forward(rgb_lin, xyz_base)
+        xyz_rel = self._predict_forward_relative(rgb)
+        xyz = self.black_xyz[None, :] + xyz_rel * self._xyz_span()[None, :]
+        if clip:
+            xyz = np.clip(xyz, self.black_xyz[None, :], self.white_xyz[None, :])
         return xyz[0] if squeeze else xyz
 
     def xyz_to_rgb(self, xyz_values, clip=False, as_int=True):
         xyz, squeeze = self._as_nx3(xyz_values, "xyz_values")
-
-        rgb_lin = self._base_rgb_lin_from_xyz(xyz)
-        if clip:
-            rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
-
-        if self.gray_correction_enabled and self.gray_lin is not None:
-            for _ in range(4):
-                s = rgb_lin.mean(axis=1)
-                w = self._neutrality_weight(rgb_lin)
-                d = self._gray_delta_from_lin(s)
-                xyz_adj = xyz - w[:, None] * d
-                rgb_lin = self._base_rgb_lin_from_xyz(xyz_adj)
-                if clip:
-                    rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
-
-        rgb_norm = self._lin_to_rgb_norm(rgb_lin, clip=clip)
+        rgb_norm = self._predict_inverse(xyz)
         rgb = 255.0 * rgb_norm
 
         if clip:
@@ -809,13 +733,13 @@ class XYZRGBScreenModel:
 
     def xyz_to_cie_luv(self, xyz_values, reference_xyz):
         xyz, squeeze = self._as_nx3(xyz_values, "xyz_values")
-        luv_df = xyz_to_cie_luv(xyz, reference_xyz)
+        luv_df = xyz_to_cie_luv(xyz, reference_xyz, xyz_cmf=self.xyz_cmf)
         out = luv_df[["L", "u", "v"]].to_numpy(dtype=float)
         return out[0] if squeeze else out
 
     def cie_luv_to_xyz(self, luv_values, reference_xyz):
         luv, squeeze = self._as_nx3(luv_values, "luv_values")
-        xyz_df = cie_luv_to_xyz(luv, reference_xyz)
+        xyz_df = cie_luv_to_xyz(luv, reference_xyz, xyz_cmf=self.xyz_cmf)
         out = xyz_df[["X", "Y", "Z"]].to_numpy(dtype=float)
         return out[0] if squeeze else out
 

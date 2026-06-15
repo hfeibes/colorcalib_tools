@@ -1,0 +1,54 @@
+{
+  "grey_info": {
+    "circle_radius_uv": 92.3010445516843,
+    "grey_L": 70.0,
+    "grey_X": 0.1539270869159184,
+    "grey_Y": 0.15371359035570975,
+    "grey_Z": 0.17036201161090803,
+    "grey_b_float": 163.2914612442255,
+    "grey_b_int": 163,
+    "grey_g_float": 165.29743820428848,
+    "grey_g_int": 165,
+    "grey_in_gamut": true,
+    "grey_r_float": 173.73058028519154,
+    "grey_r_int": 174,
+    "grey_selection_mode": "optimized",
+    "grey_slice_tolerance_used": 0.25,
+    "grey_u": 12.406933120096937,
+    "grey_v": -8.907369814500072,
+    "grid_step_u": 2.3075261137921075,
+    "grid_step_v": 2.3075261137921075,
+    "output_name_suffix": "",
+    "refinement": 2,
+    "selection_mode": "optimized",
+    "u_bounds": [
+      -218.3456782591138,
+      243.15954449930769
+    ],
+    "v_bounds": [
+      -239.65998119371082,
+      221.84524156471068
+    ],
+    "valid_fraction": 0.21647979010420534,
+    "white_L": 100.0,
+    "white_X": 0.3456271602770004,
+    "white_Y": 0.3772166732675517,
+    "white_Z": 0.3787503481438362
+  },
+  "grey_selection_mode": "optimized",
+  "max_out_of_gamut_channels": 0,
+  "n_base_colors": 36,
+  "n_luminance_levels": 11,
+  "n_out_of_gamut_colors": 0,
+  "n_selectable_colors": 396,
+  "output_name_suffix": "",
+  "rgb_output_path": "/Users/loggiasr/Projects/colorcalib_tools/calibration/outputs/03_map_cieluv_targets_to_new_screen/data/new_screen_colors_rgb.tsv",
+  "set_grey_xyz": null,
+  "white_reference_L": 100.0,
+  "white_reference_xyz": [
+    0.3456271602770004,
+    0.3772166732675517,
+    0.3787503481438362
+  ],
+  "xyz_output_path": "/Users/loggiasr/Projects/colorcalib_tools/calibration/outputs/03_map_cieluv_targets_to_new_screen/data/new_screen_colors_xyz.tsv"
+}

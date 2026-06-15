@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+Standalone RGB -> XYZ MLP model for screen calibration.
+
+The architecture mirrors the XYZ -> RGB model:
+
+    z-scored RGB (3)
+        -> Linear(hidden_dim)
+        -> sigmoid
+        -> Linear(3)
+        -> XYZ
+
+RGB inputs remain in display units during API use (`0..255`) and are z-scored
+internally using training-set statistics. XYZ outputs are returned as floats.
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+def _require_torch():
+    try:
+        import torch  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "PyTorch is required for RGBToXYZMLP. Install/fix torch in this environment."
+        ) from exc
+    return torch
+
+
+class _SigmoidMLP:
+    def __init__(self, torch_module, hidden_dim: int):
+        if int(hidden_dim) < 1:
+            raise ValueError("hidden_dim must be >= 1.")
+
+        T = torch_module
+        self.torch = T
+        self.hidden_dim = int(hidden_dim)
+        self.fc1 = T.nn.Linear(3, self.hidden_dim)
+        self.fc2 = T.nn.Linear(self.hidden_dim, 3)
+        T.nn.init.xavier_uniform_(self.fc1.weight)
+        T.nn.init.zeros_(self.fc1.bias)
+        T.nn.init.xavier_uniform_(self.fc2.weight)
+        T.nn.init.zeros_(self.fc2.bias)
+
+    def parameters(self):
+        return list(self.fc1.parameters()) + list(self.fc2.parameters())
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "hidden_dim": self.hidden_dim,
+            "fc1": self.fc1.state_dict(),
+            "fc2": self.fc2.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.fc1.load_state_dict(state["fc1"])
+        self.fc2.load_state_dict(state["fc2"])
+
+    def train(self) -> None:
+        self.fc1.train()
+        self.fc2.train()
+
+    def eval(self) -> None:
+        self.fc1.eval()
+        self.fc2.eval()
+
+    def __call__(self, x_t):
+        T = self.torch
+        hidden = T.sigmoid(self.fc1(x_t))
+        return self.fc2(hidden)
+
+
+@dataclass(frozen=True)
+class XYZPredictionBundle:
+    xyz_float: np.ndarray
+    invalid_mask: np.ndarray
+    invalid_row_count: int
+    invalid_channel_count: int
+
+
+class RGBToXYZMLP:
+    """
+    Small MLP mapping display RGB to XYZ.
+
+    Notes
+    -----
+    - RGB inputs are z-scored using training-set mean / std.
+    - XYZ targets are learned directly in native XYZ units.
+    - Warnings are emitted when predicted XYZ values are negative or non-finite.
+    """
+
+    def __init__(self, hidden_dim: int = 16):
+        self.hidden_dim = int(hidden_dim)
+        self.model = None
+        self.rgb_mean = np.zeros(3, dtype=float)
+        self.rgb_std = np.ones(3, dtype=float)
+        self.fit_summary: dict[str, Any] = {}
+
+    @staticmethod
+    def _as_nx3(values: Any, name: str) -> tuple[np.ndarray, bool]:
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim == 1:
+            if arr.shape[0] != 3:
+                raise ValueError(f"{name} must have length 3 or shape Nx3.")
+            return arr[None, :], True
+        if arr.ndim != 2 or arr.shape[1] != 3:
+            raise ValueError(f"{name} must have shape Nx3.")
+        return arr, False
+
+    def _normalize_rgb(self, rgb_values: Any) -> np.ndarray:
+        rgb, _ = self._as_nx3(rgb_values, "rgb_values")
+        if np.any(~np.isfinite(rgb)):
+            raise ValueError("rgb_values must be finite.")
+        if np.any((rgb < 0.0) | (rgb > 255.0)):
+            raise ValueError("rgb_values must lie within [0, 255].")
+        return (rgb - self.rgb_mean[None, :]) / self.rgb_std[None, :]
+
+    def _ensure_model(self):
+        if self.model is None:
+            raise RuntimeError("Model is not fitted/loaded.")
+        return self.model
+
+    def fit(
+        self,
+        rgb_train: Any,
+        xyz_train: Any,
+        rgb_test: Any | None = None,
+        xyz_test: Any | None = None,
+        *,
+        max_steps: int = 50000,
+        learning_rate: float = 1e-3,
+        l2_weight: float = 5e-4,
+        grad_clip_norm: float = 5.0,
+        log_every: int = 100,
+        verbose: bool = False,
+    ):
+        train_rgb, _ = self._as_nx3(rgb_train, "rgb_train")
+        train_xyz, _ = self._as_nx3(xyz_train, "xyz_train")
+        if train_rgb.shape[0] != train_xyz.shape[0]:
+            raise ValueError("rgb_train and xyz_train must have the same number of rows.")
+        if train_rgb.shape[0] < 2:
+            raise ValueError("Need at least two training rows.")
+        if np.any(~np.isfinite(train_rgb)) or np.any(~np.isfinite(train_xyz)):
+            raise ValueError("Training inputs must be finite.")
+        if np.any((train_rgb < 0.0) | (train_rgb > 255.0)):
+            raise ValueError("Training RGB values must lie within [0, 255].")
+
+        if (rgb_test is None) != (xyz_test is None):
+            raise ValueError("rgb_test and xyz_test must either both be provided or both be omitted.")
+
+        if rgb_test is not None:
+            test_rgb, _ = self._as_nx3(rgb_test, "rgb_test")
+            test_xyz, _ = self._as_nx3(xyz_test, "xyz_test")
+            if test_rgb.shape[0] != test_xyz.shape[0]:
+                raise ValueError("rgb_test and xyz_test must have the same number of rows.")
+            if np.any(~np.isfinite(test_rgb)) or np.any(~np.isfinite(test_xyz)):
+                raise ValueError("Test inputs must be finite.")
+            if np.any((test_rgb < 0.0) | (test_rgb > 255.0)):
+                raise ValueError("Test RGB values must lie within [0, 255].")
+        else:
+            test_rgb = None
+            test_xyz = None
+
+        self.rgb_mean = np.mean(train_rgb, axis=0)
+        self.rgb_std = np.std(train_rgb, axis=0)
+        self.rgb_std = np.where(self.rgb_std > 1e-8, self.rgb_std, 1.0)
+
+        train_rgb_norm = self._normalize_rgb(train_rgb)
+        if test_rgb is not None:
+            test_rgb_norm = self._normalize_rgb(test_rgb)
+        else:
+            test_rgb_norm = None
+
+        torch = _require_torch()
+        self.model = _SigmoidMLP(torch_module=torch, hidden_dim=self.hidden_dim)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=float(learning_rate))
+
+        x_train_t = torch.tensor(train_rgb_norm, dtype=torch.float32)
+        y_train_t = torch.tensor(train_xyz, dtype=torch.float32)
+        if test_rgb_norm is not None:
+            x_test_t = torch.tensor(test_rgb_norm, dtype=torch.float32)
+            y_test_t = torch.tensor(test_xyz, dtype=torch.float32)
+        else:
+            x_test_t = None
+            y_test_t = None
+
+        history_rows: list[dict[str, float]] = []
+        best_score = None
+        best_state = None
+        best_step = None
+        n_steps = int(max(1, max_steps))
+        log_every = max(1, int(log_every))
+
+        for step in range(1, n_steps + 1):
+            self.model.train()
+            optimizer.zero_grad(set_to_none=True)
+            pred_train = self.model(x_train_t)
+            pred_train = torch.nan_to_num(pred_train, nan=0.0, posinf=0.0, neginf=0.0)
+
+            train_data_loss = torch.mean((pred_train - y_train_t) ** 2)
+            reg = 0.0
+            for param in self.model.parameters():
+                reg = reg + torch.mean(param * param)
+            loss = train_data_loss + float(l2_weight) * reg
+
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Encountered non-finite loss at step {step}.")
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(grad_clip_norm))
+            optimizer.step()
+
+            self.model.eval()
+            with torch.inference_mode():
+                pred_train_eval = self.model(x_train_t)
+                pred_train_eval = torch.nan_to_num(pred_train_eval, nan=0.0, posinf=0.0, neginf=0.0)
+                train_eval_loss = torch.mean((pred_train_eval - y_train_t) ** 2)
+
+                train_xyz_eval = pred_train_eval.detach().cpu().numpy().astype(float)
+                train_xyz_eval = np.maximum(train_xyz_eval, 0.0)
+                train_mae_xyz = float(np.mean(np.abs(train_xyz_eval - train_xyz)))
+                train_rmse_xyz = float(np.sqrt(np.mean((train_xyz_eval - train_xyz) ** 2)))
+
+                if x_test_t is not None:
+                    pred_test_eval = self.model(x_test_t)
+                    pred_test_eval = torch.nan_to_num(pred_test_eval, nan=0.0, posinf=0.0, neginf=0.0)
+                    test_eval_loss = torch.mean((pred_test_eval - y_test_t) ** 2)
+
+                    test_xyz_eval = pred_test_eval.detach().cpu().numpy().astype(float)
+                    test_xyz_eval = np.maximum(test_xyz_eval, 0.0)
+                    test_mae_xyz = float(np.mean(np.abs(test_xyz_eval - test_xyz)))
+                    test_rmse_xyz = float(np.sqrt(np.mean((test_xyz_eval - test_xyz) ** 2)))
+                    score = float(test_eval_loss.detach().cpu())
+                else:
+                    test_eval_loss = None
+                    test_mae_xyz = float("nan")
+                    test_rmse_xyz = float("nan")
+                    score = float(train_eval_loss.detach().cpu())
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best_state = self.model.state_dict()
+                best_step = step
+
+            if step == 1 or step % log_every == 0 or step == n_steps:
+                row = {
+                    "step": float(step),
+                    "train_total_loss": float(loss.detach().cpu()),
+                    "train_data_loss": float(train_eval_loss.detach().cpu()),
+                    "train_mae_xyz": train_mae_xyz,
+                    "train_rmse_xyz": train_rmse_xyz,
+                    "test_data_loss": float(test_eval_loss.detach().cpu()) if test_eval_loss is not None else float("nan"),
+                    "test_mae_xyz": test_mae_xyz,
+                    "test_rmse_xyz": test_rmse_xyz,
+                }
+                history_rows.append(row)
+                if verbose:
+                    if test_eval_loss is None:
+                        print(
+                            f"[fit] step={step}/{n_steps} "
+                            f"train_loss={row['train_data_loss']:.8f} "
+                            f"train_mae_xyz={train_mae_xyz:.6f}"
+                        )
+                    else:
+                        print(
+                            f"[fit] step={step}/{n_steps} "
+                            f"train_loss={row['train_data_loss']:.8f} "
+                            f"test_loss={row['test_data_loss']:.8f} "
+                            f"train_mae_xyz={train_mae_xyz:.6f} "
+                            f"test_mae_xyz={test_mae_xyz:.6f}"
+                        )
+
+        if best_state is None or best_step is None:
+            raise RuntimeError("Fit did not produce a valid model state.")
+
+        self.model.load_state_dict(best_state)
+        self.model.eval()
+
+        self.fit_summary = {
+            "hidden_dim": self.hidden_dim,
+            "max_steps": n_steps,
+            "learning_rate": float(learning_rate),
+            "l2_weight": float(l2_weight),
+            "grad_clip_norm": float(grad_clip_norm),
+            "best_step": int(best_step),
+            "best_score": float(best_score),
+            "n_train": int(train_rgb.shape[0]),
+            "n_test": int(0 if test_rgb is None else test_rgb.shape[0]),
+        }
+
+        import pandas as pd  # noqa: PLC0415
+
+        return pd.DataFrame(history_rows)
+
+    def predict_xyz(
+        self,
+        rgb_values: Any,
+        *,
+        warn: bool = True,
+        clip_min_zero: bool = True,
+    ) -> XYZPredictionBundle:
+        rgb, squeeze = self._as_nx3(rgb_values, "rgb_values")
+        rgb_norm = self._normalize_rgb(rgb)
+        model = self._ensure_model()
+        torch = _require_torch()
+        model.eval()
+        with torch.inference_mode():
+            x_t = torch.tensor(rgb_norm, dtype=torch.float32)
+            pred = model(x_t).detach().cpu().numpy().astype(float)
+
+        raw_pred = pred.copy()
+        invalid_mask = (~np.isfinite(raw_pred)) | (raw_pred < 0.0)
+        invalid_row_count = int(np.sum(np.any(invalid_mask, axis=1)))
+        invalid_channel_count = int(np.sum(invalid_mask))
+
+        if warn and invalid_channel_count > 0:
+            warnings.warn(
+                (
+                    f"RGBToXYZMLP predicted {invalid_channel_count} XYZ values that were "
+                    f"negative or non-finite across {invalid_row_count} rows."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        pred = np.nan_to_num(raw_pred, nan=0.0, posinf=0.0, neginf=0.0)
+        if clip_min_zero:
+            pred = np.maximum(pred, 0.0)
+
+        if squeeze:
+            return XYZPredictionBundle(
+                xyz_float=pred[0],
+                invalid_mask=invalid_mask[0],
+                invalid_row_count=invalid_row_count,
+                invalid_channel_count=invalid_channel_count,
+            )
+
+        return XYZPredictionBundle(
+            xyz_float=pred,
+            invalid_mask=invalid_mask,
+            invalid_row_count=invalid_row_count,
+            invalid_channel_count=invalid_channel_count,
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        model = self._ensure_model()
+        return {
+            "model_type": "RGBToXYZMLP",
+            "state_format": "RGBToXYZMLP.sigmoid_hidden.v1",
+            "hidden_dim": self.hidden_dim,
+            "rgb_mean": self.rgb_mean.tolist(),
+            "rgb_std": self.rgb_std.tolist(),
+            "fit_summary": self.fit_summary,
+            "model_state": model.state_dict(),
+        }
+
+    def save_state(self, path: str | Path) -> Path:
+        torch = _require_torch()
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.state_dict(), out_path)
+        return out_path
+
+    @classmethod
+    def load_state(cls, path: str | Path) -> "RGBToXYZMLP":
+        torch = _require_torch()
+        state = torch.load(Path(path), map_location="cpu")
+        if state.get("model_type") != "RGBToXYZMLP":
+            raise ValueError(f"Unsupported model_type: {state.get('model_type')}")
+
+        model = cls(hidden_dim=int(state["hidden_dim"]))
+        model.rgb_mean = np.asarray(state["rgb_mean"], dtype=float)
+        model.rgb_std = np.asarray(state["rgb_std"], dtype=float)
+        model.rgb_std = np.where(model.rgb_std > 1e-8, model.rgb_std, 1.0)
+        model.fit_summary = dict(state.get("fit_summary", {}))
+
+        model.model = _SigmoidMLP(torch_module=torch, hidden_dim=model.hidden_dim)
+        model.model.load_state_dict(state["model_state"])
+        model.model.eval()
+        return model

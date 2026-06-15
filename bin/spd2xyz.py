@@ -2,7 +2,7 @@
 Convert PR spectra measurements to XYZ values.
 
 This module provides a callable function:
-    convert_spd_csv_to_xyz(input_file, output_file, cmf="ciejudd", cmf_file=None)
+    convert_spd_csv_to_xyz(input_file, output_file, cmf="cie_judd", cmf_file=None)
 """
 
 from pathlib import Path
@@ -12,7 +12,18 @@ import pandas as pd
 from scipy.interpolate import CubicSpline
 
 
-DEFAULT_CIEJUDD_CMF = Path(__file__).resolve().parents[1] / "color_matching_functions" / "ciexyzj.txt"
+DEFAULT_CIE_JUDD_CMF = Path(__file__).resolve().parents[1] / "color_matching_functions" / "ciexyz31.txt"
+
+
+def _normalize_cmf(cmf):
+    key = str(cmf).strip().lower().replace("-", "").replace("_", "")
+    judd_aliases = {"ciejudd", "judd", "ciejudd1951", "judd1951", "31"}
+    if key in judd_aliases:
+        return "cie_judd"
+    raise ValueError(
+        f"Unsupported cmf '{cmf}'. "
+        "This project supports CIE Judd-corrected XYZ only."
+    )
 
 
 def _interp_to_1nm_domain(x, y):
@@ -63,12 +74,12 @@ def common_domain(x1, y1, x2, y2):
     return xc, y1c, y2c
 
 
-def _load_cmf(cmf="ciejudd", cmf_file=None):
-    cmf_key = str(cmf).strip().lower()
-    if cmf_key != "ciejudd":
-        raise ValueError(f"Unsupported cmf '{cmf}'. Only 'ciejudd' is currently supported.")
+def _load_cmf(cmf="cie_judd", cmf_file=None):
+    cmf_key = _normalize_cmf(cmf)
+    if cmf_key != "cie_judd":
+        raise ValueError(f"Unsupported cmf '{cmf}'. Only 'cie_judd' is supported.")
 
-    cmf_path = Path(cmf_file) if cmf_file else DEFAULT_CIEJUDD_CMF
+    cmf_path = Path(cmf_file) if cmf_file else DEFAULT_CIE_JUDD_CMF
     cmf_df = pd.read_csv(
         cmf_path,
         header=None,
@@ -80,7 +91,7 @@ def _load_cmf(cmf="ciejudd", cmf_file=None):
     return x, y
 
 
-def convert_spd_csv_to_xyz(input_file, output_file, cmf="ciejudd", cmf_file=None):
+def convert_spd_csv_to_xyz(input_file, output_file, cmf="cie_judd", cmf_file=None):
     """
     Convert spectra CSV to XYZ CSV.
 
@@ -90,7 +101,7 @@ def convert_spd_csv_to_xyz(input_file, output_file, cmf="ciejudd", cmf_file=None
         Path to spectra CSV with columns: rep, id, r, g, b, nm, power
     output_file : str | Path
         Path to output XYZ CSV.
-    cmf : str, default "ciejudd"
+    cmf : str, default "cie_judd"
         Color matching function identifier.
     cmf_file : str | Path | None
         Optional custom CMF file path.
@@ -142,8 +153,8 @@ def main():
     parser.add_argument("output_file", help="Output XYZ CSV path.")
     parser.add_argument(
         "--cmf",
-        default="judd",
-        help="Color matching function to use (currently only: judd).",
+        default="cie_judd",
+        help="Color matching function to use (currently only: cie_judd).",
     )
     parser.add_argument(
         "--cmf-file",

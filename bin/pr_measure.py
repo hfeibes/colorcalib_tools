@@ -27,8 +27,8 @@ parser.add_argument('--waittime', type=float, default=3.0, help='time between co
 parser.add_argument('--reps', type=int, default=1, help='how many measures to take per color')
 parser.add_argument('--screenpixw', default=2560, type=int)
 parser.add_argument('--screenpixh', default=1600, type=int)
-parser.add_argument('--on_timer', default=False, type=_str2bool)
-parser.add_argument('--time_between', default=20., type=float)
+parser.add_argument('--on_timer', default=0, type=_str2bool)
+parser.add_argument('--time_between', default=1., type=float)
 args = parser.parse_args()
 
 try:

@@ -1,0 +1,23 @@
+{
+  "black_id": 0,
+  "cmf": "cie1931",
+  "cmf_file": "/Users/loggiasr/Projects/colorcalib_tools/color_matching_functions/ciexyz31.txt",
+  "default_input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/color_battery_amoled_B.csv",
+  "extra_guaranteed_train_ids": [
+    156,
+    157
+  ],
+  "grad_clip_norm": 5.0,
+  "hidden_dim": 16,
+  "input_files": [
+    "/Users/loggiasr/Projects/colorcalib_tools/input_files/color_battery_amoled_B.csv"
+  ],
+  "l2_weight": 0.0005,
+  "learning_rate": 0.01,
+  "log_every": 100,
+  "max_steps": 20000,
+  "output_root": "/Users/loggiasr/Projects/colorcalib_tools/calibration/outputs/02_fit_screen_model",
+  "random_seed": 2026,
+  "train_fraction": 0.95,
+  "white_id": 1
+}

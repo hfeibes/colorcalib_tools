@@ -1,0 +1,164 @@
+{
+  "fit_space": {
+    "description": "Grey-relative chromatic vectors in CIE-LUV units normalized to a fixed L*.",
+    "normalized_lstar": 100.0,
+    "u_formula": "13 * L_norm * (u'_color - u'_grey)",
+    "v_formula": "13 * L_norm * (v'_color - v'_grey)",
+    "ellipse_fit_basis": "Handle clusters are averaged across their grouped lightness levels, then weighted by valid sample count."
+  },
+  "ellipse": {
+    "center_u": 0.0,
+    "center_v": 0.0,
+    "axis_a": 55.94851119485686,
+    "axis_b": 45.29423643421783,
+    "axis_ratio": 1.235223631070866,
+    "angle_rad": 1.5292298323598859,
+    "rmse": 0.08099612952267064,
+    "objective": 0.009879338557809206,
+    "iterations": 8,
+    "converged": true,
+    "parametric_equation": {
+      "u_t": "a*cos(t)*cos(phi) - b*sin(t)*sin(phi)",
+      "v_t": "a*cos(t)*sin(phi) + b*sin(t)*cos(phi)"
+    }
+  },
+  "alignment": {
+    "spacing_definition": "Adjacent target colors are constrained to have equal Euclidean distance in the ambient 2D fit plane (equal chord length). Ellipse arc lengths between neighbors are not constrained to be equal.",
+    "direction_sign": 1,
+    "circumference": 318.9446523779056,
+    "colors_per_segment": 6,
+    "n_output_colors": 36,
+    "n_handles": 6,
+    "equal_chord_length": 8.847758591242503,
+    "start_path_s": 243.29966564265328,
+    "alignment_objective": 31.827434161743696,
+    "adjacent_arc_length_min": 8.853819600494093,
+    "adjacent_arc_length_max": 8.869295897093268,
+    "adjacent_arc_length_mean": 8.859573677164077,
+    "adjacent_chord_length_min": 8.847758591063013,
+    "adjacent_chord_length_max": 8.847758591385066,
+    "adjacent_chord_length_mean": 8.847758591214756
+  },
+  "ids": {
+    "white_id": 0,
+    "black_id": 1,
+    "grey_id": 2,
+    "fit_color_ids": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "fit_color_ids_skipped_as_missing": [
+      6
+    ],
+    "handle_groups": [
+      [
+        3,
+        9,
+        15
+      ],
+      [
+        4,
+        10,
+        16
+      ],
+      [
+        5,
+        11,
+        17
+      ],
+      [
+        6,
+        12,
+        18
+      ],
+      [
+        7,
+        13,
+        19
+      ],
+      [
+        8,
+        14,
+        20
+      ]
+    ],
+    "handle_labels": [
+      "RED",
+      "YELLOW",
+      "GREEN",
+      "CYAN",
+      "BLUE",
+      "MAGENTA"
+    ]
+  },
+  "inputs": [
+    "input_files/Apollo_spec_webcolor.csv",
+    "input_files/Apollo_spec.csv",
+    "input_files/Curiosity_spec_webcolor.csv",
+    "input_files/Curiosity_spec.csv",
+    "input_files/Sputnik_spec_webcolor.csv",
+    "input_files/Sputnik_spec.csv",
+    "input_files/Voyager_spec_webcolor.csv",
+    "input_files/Voyager_spec.csv"
+  ],
+  "input_modes": [
+    {
+      "tablet_index": 0,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Apollo_spec_webcolor.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 1,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Apollo_spec.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 2,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Curiosity_spec_webcolor.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 3,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Curiosity_spec.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 4,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Sputnik_spec_webcolor.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 5,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Sputnik_spec.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 6,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Voyager_spec_webcolor.csv",
+      "input_mode": "spd"
+    },
+    {
+      "tablet_index": 7,
+      "input_file": "/Users/loggiasr/Projects/colorcalib_tools/input_files/Voyager_spec.csv",
+      "input_mode": "spd"
+    }
+  ],
+  "cmf": "cie1931",
+  "cmf_file": "/Users/loggiasr/Projects/colorcalib_tools/color_matching_functions/ciexyz31.txt"
+}
